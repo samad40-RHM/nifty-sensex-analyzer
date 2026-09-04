@@ -1,0 +1,37 @@
+INDICES = {
+    "NIFTY 50": "^NSEI",
+    "SENSEX": "^BSESN",
+}
+
+HISTORY_PERIOD = "5y"
+INTERVAL = "1d"
+
+SMA_FAST = 20
+SMA_SLOW = 50
+EMA_FAST = 9
+EMA_SLOW = 21
+RSI_PERIOD = 14
+MACD_FAST = 12
+MACD_SLOW = 26
+MACD_SIGNAL = 9
+BOLLINGER_PERIOD = 20
+BOLLINGER_STD = 2
+ATR_PERIOD = 14
+
+WEIGHTS = {
+    "trend": 0.30,
+    "momentum": 0.25,
+    "macd": 0.25,
+    "volatility": 0.10,
+    "volume": 0.10,
+}
+
+BUY_THRESHOLD = 0.25
+SELL_THRESHOLD = -0.25
+
+BACKTEST_CAPITAL = 100000
+TRANSACTION_COST_PCT = 0.0005
+
+ML_MODEL_PATH_TEMPLATE = "models/{name}_rf_model.joblib"
+ML_TEST_SIZE = 0.2
+ML_LOOKAHEAD_DAYS = 1
