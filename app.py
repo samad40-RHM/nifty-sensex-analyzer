@@ -21,12 +21,25 @@ with st.sidebar:
 
 ticker = cfg.INDICES[index_name]
 
-
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_and_process(ticker, period):
     raw = data_fetcher.fetch_history(ticker, period, cfg.INTERVAL)
     enriched = indicators.add_all_indicators(raw)
-    return signal_engine.annotate_signals(enriched)
+    enriched = indicators.add_supertrend_adx(enriched)
+    scored = signal_engine.annotate_signals(enriched)
+    scored["ST_SIGNAL"] = scored.apply(signal_engine.supertrend_adx_signal, axis=1)
+
+    def combined(r):
+        if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY":
+            return "STRONG BUY"
+        if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL":
+            return "STRONG SELL"
+        if r["SIGNAL"] == "HOLD" and r["ST_SIGNAL"] == "HOLD":
+            return "HOLD"
+        return "MIXED / CAUTION"
+
+    scored["FINAL_SIGNAL"] = scored.apply(combined, axis=1)
+    return scored
 
 
 if run_button or "last_df" not in st.session_state:
