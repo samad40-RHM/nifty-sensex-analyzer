@@ -111,6 +111,6 @@ eq_fig = go.Figure()
 eq_fig.add_trace(go.Scatter(x=result["equity_curve"].index, y=result["equity_curve"]["EQUITY_CURVE"], name="Strategy"))
 eq_fig.add_trace(go.Scatter(x=result["equity_curve"].index, y=result["equity_curve"]["BUY_HOLD_EQUITY"], name="Buy & Hold"))
 st.plotly_chart(eq_fig, use_container_width=True)
+st.dataframe(df[["Close", "RSI", "MACD", "SCORE", "SIGNAL", "ADX", "ST_SIGNAL", "FINAL_SIGNAL"]].tail(20).sort_index(ascending=False), use_container_width=True)
 
-st.dataframe(df[["Close", "RSI", "MACD", "SCORE", "SIGNAL"]].tail(20).sort_index(ascending=False), use_container_width=True)
 st.caption("Not financial advice. For educational use only.")
