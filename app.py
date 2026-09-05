@@ -116,7 +116,12 @@ fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="BU
 fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="SELL", marker=dict(color="red", size=8, symbol="triangle-down")))
 fig.update_layout(height=600, xaxis_rangeslider_visible=False)
 fig.update_layout(height=600)
-st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": True, "scrollZoom": True})
+st.plotly_chart(fig, use_container_width=True, config={
+    "displayModeBar": True,
+    "scrollZoom": False,
+    "responsive": True,
+    "doubleClick": "reset"
+})
 buy_points = df[df["FINAL_SIGNAL"].isin(["BUY", "STRONG BUY"])]
 sell_points = df[df["FINAL_SIGNAL"].isin(["SELL", "STRONG SELL"])]
 
