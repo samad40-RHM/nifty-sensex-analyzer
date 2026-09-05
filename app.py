@@ -119,7 +119,7 @@ st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("Backtest vs Buy & Hold")
 result = backtester.run_backtest(df, allow_short=allow_short)
-b1, b2, b3,
+b1, b2, b3 ,= st.column(3)
 b4 = st.columns(4)
 b1.metric("Strategy Return", f"{result['total_return_pct']}%")
 b2.metric("Buy & Hold", f"{result['buy_hold_return_pct']}%")
