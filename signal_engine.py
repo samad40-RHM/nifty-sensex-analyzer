@@ -76,3 +76,10 @@ def explain_latest(df_row):
         "composite": round(composite_score(df_row), 3),
         "decision": decision_from_score(composite_score(df_row)),
     }
+
+def supertrend_adx_signal(row, adx_threshold=22):
+    if row["SUPERTREND_DIR"] == 1 and row["ADX"] >= adx_threshold:
+        return "BUY"
+    if row["SUPERTREND_DIR"] == -1 and row["ADX"] >= adx_threshold:
+        return "SELL"
+    return "HOLD"
