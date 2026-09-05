@@ -116,6 +116,24 @@ fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="BU
 fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="SELL", marker=dict(color="red", size=8, symbol="triangle-down")))
 fig.update_layout(height=600, xaxis_rangeslider_visible=False)
 st.plotly_chart(fig, use_container_width=True)
+buy_points = df[df["FINAL_SIGNAL"].isin(["BUY", "STRONG BUY"])]
+sell_points = df[df["FINAL_SIGNAL"].isin(["SELL", "STRONG SELL"])]
+
+fig.add_trace(go.Scatter(
+    x=buy_points.index,
+    y=buy_points["Low"] * 0.995,
+    mode="markers",
+    name="BUY Signal",
+    marker=dict(symbol="triangle-up", size=14, color="green", line=dict(width=1, color="darkgreen"))
+))
+
+fig.add_trace(go.Scatter(
+    x=sell_points.index,
+    y=sell_points["High"] * 1.005,
+    mode="markers",
+    name="SELL Signal",
+    marker=dict(symbol="triangle-down", size=14, color="red", line=dict(width=1, color="darkred"))
+))
 
 st.subheader("Backtest vs Buy & Hold")
 result = backtester.run_backtest(df, allow_short=allow_short)
