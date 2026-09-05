@@ -63,7 +63,24 @@ prev_close = df.iloc[-2]["Close"] if len(df) > 1 else latest["Close"]
 col2.metric("Daily Change", f"{(latest['Close']/prev_close-1)*100:+.2f}%")
 col3.metric("Composite Score", f"{explain['composite']:+.2f}")
 color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[explain["decision"]]
-col4.markdown(f"<h2 style='color:{color};text-align:center'>{explain['decision']}</h2>", unsafe_allow_html=True)
+col4.markdown(f"<h4 style='color:{color};text-align:center'>Rule Engine: {explain['decision']}</h4>", unsafe_allow_html=True)
+
+st.subheader("Special Indicator: Supertrend + ADX (Trend Strength)")
+sc1, sc2, sc3 = st.columns(3)
+sc1.metric("Supertrend Direction", "Uptrend" if latest["SUPERTREND_DIR"] == 1 else "Downtrend")
+sc2.metric("ADX (trend strength)", f"{latest['ADX']:.1f}")
+st_signal = latest["ST_SIGNAL"]
+st_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[st_signal]
+sc3.markdown(f"<h4 style='color:{st_color};text-align:center'>Supertrend: {st_signal}</h4>", unsafe_allow_html=True)
+
+final_signal = latest["FINAL_SIGNAL"]
+final_color = {"STRONG BUY": "darkgreen", "STRONG SELL": "darkred", "HOLD": "gray", "MIXED / CAUTION": "orange"}[final_signal]
+st.markdown(
+    f"<div style='background-color:{final_color};padding:20px;border-radius:10px;text-align:center'>"
+    f"<h1 style='color:white;margin:0'>{final_signal}</h1></div>",
+    unsafe_allow_html=True
+)
+st.caption("STRONG BUY/SELL = both the rule engine and Supertrend+ADX agree. MIXED/CAUTION = they disagree, meaning conditions are less clear-cut today.")
 
 st.subheader("Why this signal?")
 st.dataframe(pd.DataFrame({
@@ -75,6 +92,7 @@ fig = go.Figure()
 fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"))
 fig.add_trace(go.Scatter(x=df.index, y=df["SMA_FAST"], name="SMA Fast", line=dict(width=1)))
 fig.add_trace(go.Scatter(x=df.index, y=df["SMA_SLOW"], name="SMA Slow", line=dict(width=1)))
+fig.add_trace(go.Scatter(x=df.index, y=df["SUPERTREND"], name="Supertrend", line=dict(width=2, color="purple", dash="dot")))
 buys, sells = df[df["SIGNAL"] == "BUY"], df[df["SIGNAL"] == "SELL"]
 fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="BUY", marker=dict(color="green", size=8, symbol="triangle-up")))
 fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="SELL", marker=dict(color="red", size=8, symbol="triangle-down")))
