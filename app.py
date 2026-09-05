@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-
+import logger
 import config as cfg
 import data_fetcher
 import indicators
@@ -81,7 +81,25 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.caption("STRONG BUY/SELL = both the rule engine and Supertrend+ADX agree. MIXED/CAUTION = they disagree, meaning conditions are less clear-cut today.")
+log_df = logger.log_daily_signal(ticker, latest)
+accuracy, valid_count = logger.compute_accuracy(log_df)
 
+st.subheader("📒 Daily Signal Log & Track Record")
+
+if accuracy is not None:
+    st.metric("Historical Accuracy (this app's own track record)", f"{accuracy:.1f}%", help=f"Based on {valid_count} completed signal days so far")
+else:
+    st.info("Not enough logged days yet to calculate accuracy. Check back after a few days of daily visits.")
+
+st.dataframe(log_df.sort_values("date", ascending=False), use_container_width=True)
+
+csv_data = log_df.to_csv(index=False).encode("utf-8")
+st.download_button(
+    label="⬇️ Download signal log as CSV (backup)",
+    data=csv_data,
+    file_name="signal_log_backup.csv",
+    mime="text/csv"
+)
 st.subheader("Why this signal?")
 st.dataframe(pd.DataFrame({
     "component": ["Trend", "Momentum(RSI)", "MACD", "Volatility(BB)", "Volume"],
@@ -101,7 +119,8 @@ st.plotly_chart(fig, use_container_width=True)
 
 st.subheader("Backtest vs Buy & Hold")
 result = backtester.run_backtest(df, allow_short=allow_short)
-b1, b2, b3, b4 = st.columns(4)
+b1, b2, b3,
+b4 = st.columns(4)
 b1.metric("Strategy Return", f"{result['total_return_pct']}%")
 b2.metric("Buy & Hold", f"{result['buy_hold_return_pct']}%")
 b3.metric("Sharpe", f"{result['sharpe_ratio']}")
