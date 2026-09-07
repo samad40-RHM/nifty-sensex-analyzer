@@ -377,8 +377,37 @@ if trade_plan is None:
 else:
     risk_amount = capital * (risk_pct / 100.0)
     position_size = int(risk_amount / trade_plan["risk_pts"]) if trade_plan["risk_pts"] > 0 else 0
+    is_long = trade_plan["direction"] == "LONG"
+
+    # --- Card-level color coding: green wash for LONG, red/orange wash for SHORT ---
+    card_bg = "#eafaf1" if is_long else "#fdf1ee"
+    card_border = "#2e7d32" if is_long else "#c0392b"
+    dir_color = "#1b7a3d" if is_long else "#c0392b"
+    dir_icon = "📈" if is_long else "📉"
+
+    # --- Plain-English one-line summary, auto-generated from the numbers ---
+    action_word = "buying (going long)" if is_long else "shorting (going short)"
+    summary_sentence = (
+        f"The system currently believes <b>{index_name}</b> is heading "
+        f"{'up' if is_long else 'down'}. If you were {action_word} at "
+        f"<b>{trade_plan['entry']:,.2f}</b>, this plan caps your loss if price "
+        f"{'falls' if is_long else 'rises'} to <b>{trade_plan['stop_loss']:,.2f}</b>, and books profit if "
+        f"price {'rises' if is_long else 'falls'} to <b>{trade_plan['target']:,.2f}</b> — sizing at "
+        f"<b>{position_size:,} units</b> keeps your worst-case loss near your intended "
+        f"{risk_pct}% of ₹{capital:,.0f}."
+    )
+
+    st.markdown(
+        f"""
+        <div style='background-color:{card_bg};border:1.5px solid {card_border};border-radius:12px;padding:16px 18px;margin-bottom:10px'>
+            <p style='margin:0 0 10px 0;color:#333;font-size:14.5px;line-height:1.5'>{dir_icon} {summary_sentence}</p>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
     tp1, tp2, tp3, tp4, tp5 = st.columns(5)
-    tp1.metric("Direction", trade_plan["direction"])
+    tp1.markdown(f"<p style='margin:0;color:gray;font-size:13px'>Direction</p><h3 style='margin:0;color:{dir_color}'>{dir_icon} {trade_plan['direction']}</h3>", unsafe_allow_html=True)
     tp2.metric("Entry", f"{trade_plan['entry']:,.2f}")
     tp3.metric("Stop-Loss", f"{trade_plan['stop_loss']:,.2f}", f"-{trade_plan['risk_pct']:.2f}%")
     tp4.metric("Target", f"{trade_plan['target']:,.2f}", f"+{trade_plan['reward_pct']:.2f}%")
@@ -386,6 +415,42 @@ else:
     tp6, tp7 = st.columns(2)
     tp6.metric("Risk per unit", f"{trade_plan['risk_pts']:,.2f} pts")
     tp7.metric(f"Suggested Position Size (risking {risk_pct}% of ₹{capital:,.0f})", f"{position_size:,} units")
+
+    # --- Horizontal Risk/Reward visual bar: Stop-Loss (red) <--- Entry ---> Target (green) ---
+    if is_long:
+        low_pt, mid_pt, high_pt = trade_plan["stop_loss"], trade_plan["entry"], trade_plan["target"]
+        low_label, high_label = "Stop-Loss", "Target"
+        low_color, high_color = "#e74c3c", "#27ae60"
+    else:
+        low_pt, mid_pt, high_pt = trade_plan["target"], trade_plan["entry"], trade_plan["stop_loss"]
+        low_label, high_label = "Target", "Stop-Loss"
+        low_color, high_color = "#27ae60", "#e74c3c"
+
+    span = high_pt - low_pt if high_pt != low_pt else 1
+    mid_pct = max(0, min(100, (mid_pt - low_pt) / span * 100))
+
+    st.markdown(
+        f"""
+        <div style='margin:6px 0 4px 0'>
+          <div style='display:flex;justify-content:space-between;font-size:12px;color:#555;margin-bottom:3px'>
+            <span><b style='color:{low_color}'>{low_label}</b> {low_pt:,.2f}</span>
+            <span><b>Entry</b> {mid_pt:,.2f}</span>
+            <span><b style='color:{high_color}'>{high_label}</b> {high_pt:,.2f}</span>
+          </div>
+          <div style='position:relative;height:14px;border-radius:7px;
+                      background:linear-gradient(to right, {low_color} 0%, {low_color} {mid_pct}%, {high_color} {mid_pct}%, {high_color} 100%);
+                      opacity:0.85'>
+            <div style='position:absolute;left:{mid_pct}%;top:-4px;transform:translateX(-50%);
+                        width:2px;height:22px;background:#222'></div>
+          </div>
+          <div style='display:flex;justify-content:space-between;font-size:11px;color:#888;margin-top:2px'>
+            <span>← higher risk</span><span>1 : {trade_plan['rr_ratio']:.1f} risk-reward</span><span>higher reward →</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
     st.caption(
         f"Stop-loss = 1.5× ATR({latest['ATR14']:.1f}) from entry (tightened to Supertrend if closer). "
         f"Target = 3× ATR (built-in 1:2 risk-reward). Not investment advice."
