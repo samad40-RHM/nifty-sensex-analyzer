@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import logger
 import config as cfg
@@ -47,6 +48,11 @@ with st.sidebar:
         help="Hides everything except the chart so you can analyze it in maximum space. Use the chart's own expand icon (top-right of chart) to go true browser full-screen."
     )
 
+    st.markdown("---")
+    st.header("💰 Position Sizing")
+    capital = st.number_input("Capital (₹)", min_value=1000, value=100000, step=1000)
+    risk_pct = st.number_input("Risk per trade (%)", min_value=0.1, max_value=10.0, value=1.0, step=0.1)
+
 ticker = cfg.INDICES[index_name]
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -92,6 +98,113 @@ def resample_ohlc(data, tf):
     return resampled
 
 
+def compute_atr(data, period=14):
+    """Average True Range - a real volatility measure, computed directly from OHLC."""
+    high = data["High"]
+    low = data["Low"]
+    close = data["Close"]
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(period, min_periods=1).mean()
+    return atr
+
+
+def compute_confidence(latest_row, explain_dict):
+    """
+    Confidence score (0-100%) = how many independent signals actually agree,
+    plus a bonus/penalty for trend strength (ADX).
+    """
+    directions = []
+    for key in ["trend", "momentum", "macd", "volatility", "volume"]:
+        val = explain_dict.get(key, 0)
+        if val > 0:
+            directions.append(1)
+        elif val < 0:
+            directions.append(-1)
+        else:
+            directions.append(0)
+
+    st_signal = latest_row.get("ST_SIGNAL", "HOLD")
+    if st_signal == "BUY":
+        directions.append(1)
+    elif st_signal == "SELL":
+        directions.append(-1)
+    else:
+        directions.append(0)
+
+    total = len(directions)
+    bullish = sum(1 for d in directions if d == 1)
+    bearish = sum(1 for d in directions if d == -1)
+    dominant = max(bullish, bearish)
+    base_confidence = (dominant / total) * 100 if total else 0
+
+    adx = latest_row.get("ADX", 20)
+    if adx >= 25:
+        adx_adjustment = 10
+        strength_label = "strong trend"
+    elif adx < 15:
+        adx_adjustment = -10
+        strength_label = "weak/choppy trend"
+    else:
+        adx_adjustment = 0
+        strength_label = "moderate trend"
+
+    confidence = max(0, min(100, base_confidence + adx_adjustment))
+    direction = "BULLISH" if bullish > bearish else ("BEARISH" if bearish > bullish else "NEUTRAL")
+    return round(confidence), direction, dominant, total, strength_label
+
+
+def compute_trade_plan(latest_row, final_signal_val, atr_val):
+    """
+    Builds a stop-loss / target / risk-reward plan for STRONG BUY / STRONG SELL signals.
+    Risk = 1.5x ATR, Reward = 3x ATR -> built-in 1:2 Risk:Reward.
+    Stop is tightened to the Supertrend line when that's closer to entry.
+    """
+    entry = latest_row["Close"]
+    if pd.isna(atr_val) or atr_val <= 0:
+        atr_val = entry * 0.01  # fallback ~1% if ATR not yet available (early bars)
+
+    supertrend_val = latest_row.get("SUPERTREND", np.nan)
+
+    if final_signal_val == "STRONG BUY":
+        stop_loss = entry - 1.5 * atr_val
+        if not pd.isna(supertrend_val) and supertrend_val < entry:
+            stop_loss = max(stop_loss, supertrend_val)
+        target = entry + 3 * atr_val
+        risk = entry - stop_loss
+        reward = target - entry
+        direction = "LONG"
+    elif final_signal_val == "STRONG SELL":
+        stop_loss = entry + 1.5 * atr_val
+        if not pd.isna(supertrend_val) and supertrend_val > entry:
+            stop_loss = min(stop_loss, supertrend_val)
+        target = entry - 3 * atr_val
+        risk = stop_loss - entry
+        reward = entry - target
+        direction = "SHORT"
+    else:
+        return None
+
+    risk = max(risk, 0.01)
+    rr_ratio = reward / risk
+
+    return {
+        "direction": direction,
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "target": target,
+        "risk_pts": risk,
+        "reward_pts": reward,
+        "risk_pct": (risk / entry) * 100,
+        "reward_pct": (reward / entry) * 100,
+        "rr_ratio": rr_ratio,
+    }
+
+
 if run_button or "last_df" not in st.session_state:
     try:
         st.session_state["last_df"] = load_and_process(ticker, period)
@@ -110,19 +223,68 @@ if df.empty or len(df) < 2:
     st.warning("Not enough data for this timeframe. Try Daily view or a longer History window.")
     st.stop()
 
+df["ATR14"] = compute_atr(df, period=14)
+
 latest = df.iloc[-1]
 explain = signal_engine.explain_latest(latest)
 
-# ============ MAIN CHART ============
+# ============ SIGNAL BANNER + CONFIDENCE SCORE ============
 final_signal = latest["FINAL_SIGNAL"]
 final_color = {"STRONG BUY": "darkgreen", "STRONG SELL": "darkred", "HOLD": "gray", "MIXED / CAUTION": "orange"}[final_signal]
 
+confidence, conf_direction, agree_count, total_count, strength_label = compute_confidence(latest, explain)
+
 st.markdown(
-    f"<div style='background-color:{final_color};padding:14px;border-radius:10px;text-align:center;margin-bottom:10px'>"
-    f"<h2 style='color:white;margin:0'>Today's Signal: {final_signal}  |  {index_name} @ {latest['Close']:,.2f}</h2></div>",
+    f"<div style='background-color:{final_color};padding:14px;border-radius:10px;text-align:center;margin-bottom:6px'>"
+    f"<h2 style='color:white;margin:0'>Today's Signal: {final_signal}  |  {index_name} @ {latest['Close']:,.2f}</h2>"
+    f"<p style='color:white;margin:4px 0 0 0;font-size:15px'>Confidence: <b>{confidence}%</b> "
+    f"({agree_count}/{total_count} signals aligned {conf_direction.lower()}, {strength_label}, ADX {latest['ADX']:.1f})</p>"
+    f"</div>",
     unsafe_allow_html=True
 )
 
+conf_bar_color = "#00c853" if confidence >= 70 else ("#ffab00" if confidence >= 50 else "#d50000")
+st.markdown(
+    f"""
+    <div style='background-color:#e0e0e0;border-radius:8px;height:18px;width:100%;margin-bottom:14px'>
+        <div style='background-color:{conf_bar_color};width:{confidence}%;height:18px;border-radius:8px;
+                    text-align:right;color:white;font-size:11px;padding-right:6px;line-height:18px'>
+            {confidence}%
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# ============ TRADE PLAN: STOP-LOSS / TARGET / R:R / POSITION SIZE ============
+trade_plan = compute_trade_plan(latest, final_signal, latest["ATR14"])
+
+st.subheader("🎯 Trade Plan")
+if trade_plan is None:
+    st.info(f"No actionable trade plan for '{final_signal}' — plans are only generated for STRONG BUY / STRONG SELL signals, when confidence is highest.")
+else:
+    risk_amount = capital * (risk_pct / 100.0)
+    position_size = int(risk_amount / trade_plan["risk_pts"]) if trade_plan["risk_pts"] > 0 else 0
+
+    tp1, tp2, tp3, tp4, tp5 = st.columns(5)
+    tp1.metric("Direction", trade_plan["direction"])
+    tp2.metric("Entry", f"{trade_plan['entry']:,.2f}")
+    tp3.metric("Stop-Loss", f"{trade_plan['stop_loss']:,.2f}", f"-{trade_plan['risk_pct']:.2f}%")
+    tp4.metric("Target", f"{trade_plan['target']:,.2f}", f"+{trade_plan['reward_pct']:.2f}%")
+    tp5.metric("Risk : Reward", f"1 : {trade_plan['rr_ratio']:.1f}")
+
+    tp6, tp7 = st.columns(2)
+    tp6.metric("Risk per unit", f"{trade_plan['risk_pts']:,.2f} pts")
+    tp7.metric(f"Suggested Position Size (risking {risk_pct}% of ₹{capital:,.0f})", f"{position_size:,} units")
+
+    st.caption(
+        f"Stop-loss = 1.5× ATR({latest['ATR14']:.1f}) from entry (tightened to Supertrend line if closer). "
+        f"Target = 3× ATR, giving a built-in 1:2 risk-reward. Position size = "
+        f"(Capital × Risk%) ÷ Risk-per-unit, so a stop-out never costs more than your chosen risk. "
+        f"This is a mechanical suggestion, not investment advice — always sanity-check against news/events."
+    )
+
+# ============ MAIN CHART ============
 fig = go.Figure()
 fig.add_trace(go.Candlestick(
     x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
@@ -161,9 +323,14 @@ if show_final_signals:
         text=["SELL"] * len(sell_points), textposition="top center", textfont=dict(color="darkred", size=10)
     ))
 
-# ---- Build quick-zoom buttons based on ACTUAL trading-day rows in df ----
-# (This avoids the bug where calendar-day-based buttons land on weekends/holidays
-#  with zero candles and appear blank.)
+# Trade plan lines on the chart itself (stop-loss / target) for the latest signal
+if trade_plan is not None:
+    fig.add_hline(y=trade_plan["stop_loss"], line_dash="dash", line_color="red",
+                   annotation_text="Stop-Loss", annotation_position="top left")
+    fig.add_hline(y=trade_plan["target"], line_dash="dash", line_color="green",
+                   annotation_text="Target", annotation_position="bottom left")
+
+# ---- Quick-zoom buttons based on ACTUAL trading-day rows in df ----
 n = len(df)
 full_start, full_end = df.index[0], df.index[-1]
 
@@ -171,9 +338,8 @@ def window_start(num_rows):
     idx = max(0, n - num_rows)
     return df.index[idx]
 
-# Approx trading-day counts for each label (India ~21 trading days/month)
 button_specs = [
-    ("1D", 5),     # daily-only data can't show true intraday; shows last few sessions for context
+    ("1D", 5),
     ("5D", 5),
     ("1W", 5),
     ("1M", 22),
@@ -208,7 +374,6 @@ fig.update_layout(
     )]
 )
 
-# Remove weekend/holiday gaps so candles sit close together (no stretched blank space)
 fig.update_xaxes(
     rangebreaks=[dict(bounds=["sat", "mon"])],
     rangeslider=dict(visible=False),
@@ -238,8 +403,8 @@ st.plotly_chart(fig, use_container_width=True, config={
 st.caption(
     "💡 Buttons above the chart (1D/5D/1W/1M/3M/6M/9M/1Y/All) jump to that many "
     "*actual trading sessions* of history so you always see real candles — no blank windows. "
-    "Note: 1D/5D/1W look similar because the underlying data is daily candles, not live intraday ticks; "
-    "for true intraday 1-minute charts a paid real-time data feed would be needed. "
+    "Dashed red/green lines show the current Stop-Loss/Target from the Trade Plan above. "
+    "Note: 1D/5D/1W look similar because the underlying data is daily candles, not live intraday ticks. "
     "Drag directly on the chart or scroll to zoom to any custom range, double-click to reset."
 )
 
@@ -325,7 +490,7 @@ eq_fig.add_trace(go.Scatter(x=result["equity_curve"].index, y=result["equity_cur
 st.plotly_chart(eq_fig, use_container_width=True)
 
 st.dataframe(
-    df[["Close", "RSI", "MACD", "SCORE", "SIGNAL", "ADX", "ST_SIGNAL", "FINAL_SIGNAL"]].tail(20).sort_index(ascending=False),
+    df[["Close", "RSI", "MACD", "SCORE", "SIGNAL", "ADX", "ST_SIGNAL", "FINAL_SIGNAL", "ATR14"]].tail(20).sort_index(ascending=False),
     use_container_width=True
 )
 
