@@ -13,6 +13,18 @@ import backtester
 
 st.set_page_config(page_title="Nifty & Sensex Daily Analyzer", layout="wide")
 
+# ============ AUTO-REFRESH SETUP (for Live Market Snapshot) ============
+# Tries the lightweight `streamlit-autorefresh` component first (silent rerun,
+# no full page reload -> smoothest experience). If that package isn't
+# installed on this deployment, falls back to a browser-level meta-refresh
+# reload so auto-refresh still works either way.
+AUTOREFRESH_AVAILABLE = False
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except ImportError:
+    pass
+
 st.markdown("""
     <style>
         .block-container {padding-top: 1rem; padding-bottom: 1rem; padding-left: 1.5rem; padding-right: 1.5rem;}
@@ -57,10 +69,32 @@ def fetch_live_quote(yf_ticker):
         return None
 
 
-st.markdown("## 📡 Live Market Snapshot")
+refresh_col1, refresh_col2 = st.columns([3, 1])
+with refresh_col1:
+    st.markdown("## 📡 Live Market Snapshot")
+with refresh_col2:
+    refresh_seconds = st.selectbox(
+        "Auto-refresh every", [60, 90, 120], index=1,
+        format_func=lambda s: f"{s}s", key="refresh_interval",
+        label_visibility="collapsed"
+    )
+
+if AUTOREFRESH_AVAILABLE:
+    st_autorefresh(interval=refresh_seconds * 1000, key="live_kpi_autorefresh")
+    st.caption(f"🔁 Auto-refreshing every {refresh_seconds}s — no action needed.")
+else:
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{refresh_seconds}">',
+        unsafe_allow_html=True
+    )
+    st.caption(
+        f"🔁 Auto-refreshing every {refresh_seconds}s (fallback mode — full page reload). "
+        f"For a smoother experience without page reloads, add `streamlit-autorefresh` to requirements.txt."
+    )
+
 lk1, lk2, lk3 = st.columns([1, 1, 0.6])
 with lk3:
-    if st.button("🔄 Refresh Live Prices"):
+    if st.button("🔄 Refresh Now"):
         fetch_live_quote.clear()
 
 live_cols = st.columns(len(cfg.INDICES))
