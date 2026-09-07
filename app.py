@@ -15,6 +15,15 @@ import backtester
 
 st.set_page_config(page_title="Nifty & Sensex Daily Analyzer", layout="wide")
 
+# ============ AUTO-REFRESH SETUP (for Live Market Snapshot) ============
+AUTOREFRESH_AVAILABLE = False
+try:
+    from streamlit_autorefresh import st_autorefresh
+    AUTOREFRESH_AVAILABLE = True
+except ImportError:
+    pass
+
+
 # ============================================================================
 # 🌍 GLOBAL MARKET PULSE — overnight global cues that drive tomorrow's Indian
 # market open (US close, Europe close, Asia live during IST morning, crude
@@ -239,14 +248,6 @@ with st.expander("📰 Key Global Headlines (tap to expand)", expanded=False):
 
 st.markdown("---")
 
-
-# ============ AUTO-REFRESH SETUP (for Live Market Snapshot) ============
-AUTOREFRESH_AVAILABLE = False
-try:
-    from streamlit_autorefresh import st_autorefresh
-    AUTOREFRESH_AVAILABLE = True
-except ImportError:
-    pass
 
 st.markdown("""
     <style>
