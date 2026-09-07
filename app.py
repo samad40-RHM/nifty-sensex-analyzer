@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import yfinance as yf
 import logger
 import config as cfg
 import data_fetcher
@@ -31,10 +32,10 @@ with st.sidebar:
     st.markdown("---")
     st.header("🔍 Chart Filters")
     timeframe = st.selectbox(
-        "Candle Resolution",
+        "Candle Resolution (Swing chart)",
         ["Daily", "Weekly", "Monthly"],
         index=0,
-        help="Daily = 1 candle/day, Weekly = 1 candle/week, Monthly = 1 candle/month. Quick-zoom buttons below the chart work best with Daily."
+        help="Applies to the 1M/3M/6M/9M/1Y/All buttons. 1D/5D/1W below use real intraday data instead."
     )
     show_sma = st.checkbox("Show SMA lines", value=True)
     show_supertrend = st.checkbox("Show Supertrend line", value=True)
@@ -45,7 +46,7 @@ with st.sidebar:
     fullscreen_mode = st.checkbox(
         "🖥️ Full-Screen Chart Mode",
         value=False,
-        help="Hides everything except the chart so you can analyze it in maximum space. Use the chart's own expand icon (top-right of chart) to go true browser full-screen."
+        help="Hides everything except the chart so you can analyze it in maximum space."
     )
 
     st.markdown("---")
@@ -55,6 +56,7 @@ with st.sidebar:
 
 ticker = cfg.INDICES[index_name]
 
+# ============ DAILY DATA (drives signals, backtest, trade plan - UNCHANGED) ============
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_and_process(ticker, period):
     raw = data_fetcher.fetch_history(ticker, period, cfg.INTERVAL)
@@ -76,65 +78,49 @@ def load_and_process(ticker, period):
     return scored
 
 
+# ============ INTRADAY DATA (chart display ONLY, for 1D/5D/1W) ============
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_intraday(ticker, yf_period, yf_interval):
+    """Real minute-level candles for short-range chart zoom. Cache 5 min (intraday moves fast)."""
+    try:
+        data = yf.download(ticker, period=yf_period, interval=yf_interval, progress=False)
+        if data is None or data.empty:
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        data = data.dropna(subset=["Close"])
+        return data
+    except Exception:
+        return None
+
+
 def resample_ohlc(data, tf):
     """Resample daily-indexed data to Weekly/Monthly, NSE/Moneycontrol style."""
     if tf == "Daily":
         return data
-
     rule = "W" if tf == "Weekly" else "M"
-
-    agg = {
-        "Open": "first",
-        "High": "max",
-        "Low": "min",
-        "Close": "last",
-        "Volume": "sum",
-    }
+    agg = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
     other_cols = [c for c in data.columns if c not in agg]
     for c in other_cols:
         agg[c] = "last"
-
     resampled = data.resample(rule).agg(agg).dropna(subset=["Close"])
     return resampled
 
 
 def compute_atr(data, period=14):
-    """Average True Range - a real volatility measure, computed directly from OHLC."""
-    high = data["High"]
-    low = data["Low"]
-    close = data["Close"]
+    high = data["High"]; low = data["Low"]; close = data["Close"]
     prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(period, min_periods=1).mean()
-    return atr
+    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr.rolling(period, min_periods=1).mean()
 
 
 def compute_confidence(latest_row, explain_dict):
-    """
-    Confidence score (0-100%) = how many independent signals actually agree,
-    plus a bonus/penalty for trend strength (ADX).
-    """
     directions = []
     for key in ["trend", "momentum", "macd", "volatility", "volume"]:
         val = explain_dict.get(key, 0)
-        if val > 0:
-            directions.append(1)
-        elif val < 0:
-            directions.append(-1)
-        else:
-            directions.append(0)
-
+        directions.append(1 if val > 0 else (-1 if val < 0 else 0))
     st_signal = latest_row.get("ST_SIGNAL", "HOLD")
-    if st_signal == "BUY":
-        directions.append(1)
-    elif st_signal == "SELL":
-        directions.append(-1)
-    else:
-        directions.append(0)
+    directions.append(1 if st_signal == "BUY" else (-1 if st_signal == "SELL" else 0))
 
     total = len(directions)
     bullish = sum(1 for d in directions if d == 1)
@@ -144,14 +130,11 @@ def compute_confidence(latest_row, explain_dict):
 
     adx = latest_row.get("ADX", 20)
     if adx >= 25:
-        adx_adjustment = 10
-        strength_label = "strong trend"
+        adx_adjustment, strength_label = 10, "strong trend"
     elif adx < 15:
-        adx_adjustment = -10
-        strength_label = "weak/choppy trend"
+        adx_adjustment, strength_label = -10, "weak/choppy trend"
     else:
-        adx_adjustment = 0
-        strength_label = "moderate trend"
+        adx_adjustment, strength_label = 0, "moderate trend"
 
     confidence = max(0, min(100, base_confidence + adx_adjustment))
     direction = "BULLISH" if bullish > bearish else ("BEARISH" if bearish > bullish else "NEUTRAL")
@@ -159,15 +142,9 @@ def compute_confidence(latest_row, explain_dict):
 
 
 def compute_trade_plan(latest_row, final_signal_val, atr_val):
-    """
-    Builds a stop-loss / target / risk-reward plan for STRONG BUY / STRONG SELL signals.
-    Risk = 1.5x ATR, Reward = 3x ATR -> built-in 1:2 Risk:Reward.
-    Stop is tightened to the Supertrend line when that's closer to entry.
-    """
     entry = latest_row["Close"]
     if pd.isna(atr_val) or atr_val <= 0:
-        atr_val = entry * 0.01  # fallback ~1% if ATR not yet available (early bars)
-
+        atr_val = entry * 0.01
     supertrend_val = latest_row.get("SUPERTREND", np.nan)
 
     if final_signal_val == "STRONG BUY":
@@ -175,33 +152,22 @@ def compute_trade_plan(latest_row, final_signal_val, atr_val):
         if not pd.isna(supertrend_val) and supertrend_val < entry:
             stop_loss = max(stop_loss, supertrend_val)
         target = entry + 3 * atr_val
-        risk = entry - stop_loss
-        reward = target - entry
-        direction = "LONG"
+        risk, reward, direction = entry - stop_loss, target - entry, "LONG"
     elif final_signal_val == "STRONG SELL":
         stop_loss = entry + 1.5 * atr_val
         if not pd.isna(supertrend_val) and supertrend_val > entry:
             stop_loss = min(stop_loss, supertrend_val)
         target = entry - 3 * atr_val
-        risk = stop_loss - entry
-        reward = entry - target
-        direction = "SHORT"
+        risk, reward, direction = stop_loss - entry, entry - target, "SHORT"
     else:
         return None
 
     risk = max(risk, 0.01)
-    rr_ratio = reward / risk
-
     return {
-        "direction": direction,
-        "entry": entry,
-        "stop_loss": stop_loss,
-        "target": target,
-        "risk_pts": risk,
-        "reward_pts": reward,
-        "risk_pct": (risk / entry) * 100,
-        "reward_pct": (reward / entry) * 100,
-        "rr_ratio": rr_ratio,
+        "direction": direction, "entry": entry, "stop_loss": stop_loss, "target": target,
+        "risk_pts": risk, "reward_pts": reward,
+        "risk_pct": (risk / entry) * 100, "reward_pct": (reward / entry) * 100,
+        "rr_ratio": reward / risk,
     }
 
 
@@ -217,21 +183,18 @@ if full_df is None:
     st.info("Click 'Fetch data & analyze' to begin.")
     st.stop()
 
-df = resample_ohlc(full_df, timeframe)
+full_df["ATR14"] = compute_atr(full_df, period=14)
+swing_df = resample_ohlc(full_df, timeframe)
 
-if df.empty or len(df) < 2:
+if swing_df.empty or len(swing_df) < 2:
     st.warning("Not enough data for this timeframe. Try Daily view or a longer History window.")
     st.stop()
 
-df["ATR14"] = compute_atr(df, period=14)
-
-latest = df.iloc[-1]
+# Signals/confidence/trade-plan ALWAYS come from the real daily data (unaffected by chart zoom)
+latest = full_df.iloc[-1]
 explain = signal_engine.explain_latest(latest)
-
-# ============ SIGNAL BANNER + CONFIDENCE SCORE ============
 final_signal = latest["FINAL_SIGNAL"]
 final_color = {"STRONG BUY": "darkgreen", "STRONG SELL": "darkred", "HOLD": "gray", "MIXED / CAUTION": "orange"}[final_signal]
-
 confidence, conf_direction, agree_count, total_count, strength_label = compute_confidence(latest, explain)
 
 st.markdown(
@@ -256,168 +219,168 @@ st.markdown(
     unsafe_allow_html=True
 )
 
-# ============ TRADE PLAN: STOP-LOSS / TARGET / R:R / POSITION SIZE ============
 trade_plan = compute_trade_plan(latest, final_signal, latest["ATR14"])
 
 st.subheader("🎯 Trade Plan")
 if trade_plan is None:
-    st.info(f"No actionable trade plan for '{final_signal}' — plans are only generated for STRONG BUY / STRONG SELL signals, when confidence is highest.")
+    st.info(f"No actionable trade plan for '{final_signal}' — plans are only generated for STRONG BUY / STRONG SELL signals.")
 else:
     risk_amount = capital * (risk_pct / 100.0)
     position_size = int(risk_amount / trade_plan["risk_pts"]) if trade_plan["risk_pts"] > 0 else 0
-
     tp1, tp2, tp3, tp4, tp5 = st.columns(5)
     tp1.metric("Direction", trade_plan["direction"])
     tp2.metric("Entry", f"{trade_plan['entry']:,.2f}")
     tp3.metric("Stop-Loss", f"{trade_plan['stop_loss']:,.2f}", f"-{trade_plan['risk_pct']:.2f}%")
     tp4.metric("Target", f"{trade_plan['target']:,.2f}", f"+{trade_plan['reward_pct']:.2f}%")
     tp5.metric("Risk : Reward", f"1 : {trade_plan['rr_ratio']:.1f}")
-
     tp6, tp7 = st.columns(2)
     tp6.metric("Risk per unit", f"{trade_plan['risk_pts']:,.2f} pts")
     tp7.metric(f"Suggested Position Size (risking {risk_pct}% of ₹{capital:,.0f})", f"{position_size:,} units")
-
     st.caption(
-        f"Stop-loss = 1.5× ATR({latest['ATR14']:.1f}) from entry (tightened to Supertrend line if closer). "
-        f"Target = 3× ATR, giving a built-in 1:2 risk-reward. Position size = "
-        f"(Capital × Risk%) ÷ Risk-per-unit, so a stop-out never costs more than your chosen risk. "
-        f"This is a mechanical suggestion, not investment advice — always sanity-check against news/events."
+        f"Stop-loss = 1.5× ATR({latest['ATR14']:.1f}) from entry (tightened to Supertrend if closer). "
+        f"Target = 3× ATR (built-in 1:2 risk-reward). Not investment advice."
     )
 
-# ============ MAIN CHART ============
+# ============ CHART RANGE SELECTOR (drives which data source is used) ============
+st.markdown("### 📊 Chart")
+range_choice = st.radio(
+    "Select range",
+    ["1D", "5D", "1W", "1M", "3M", "6M", "9M", "1Y", "All"],
+    index=8, horizontal=True,
+    help="1D/5D/1W load REAL intraday candles (minute-level). 1M and beyond use daily candles from your swing data."
+)
+
+intraday_map = {
+    "1D": ("1d", "5m"),
+    "5D": ("5d", "15m"),
+    "1W": ("5d", "30m"),
+}
+
+chart_df = None
+is_intraday = False
+data_note = ""
+
+if range_choice in intraday_map:
+    yf_period, yf_interval = intraday_map[range_choice]
+    intraday_df = fetch_intraday(ticker, yf_period, yf_interval)
+    if intraday_df is not None and len(intraday_df) >= 3:
+        chart_df = intraday_df
+        is_intraday = True
+        data_note = f"Showing REAL intraday candles ({yf_interval} interval, last {yf_period}) — like a live NSE chart."
+    else:
+        chart_df = swing_df.tail(10)
+        data_note = "⚠️ Intraday data unavailable right now (market closed / feed limit) — showing last 10 daily candles instead."
+else:
+    n = len(swing_df)
+    rows_map = {"1M": 22, "3M": 66, "6M": 132, "9M": 198, "1Y": 264, "All": n}
+    rows = rows_map.get(range_choice, n)
+    chart_df = swing_df.tail(rows)
+    data_note = f"Showing daily candles ({timeframe} resolution), last {range_choice}."
+
+st.caption(f"ℹ️ {data_note}")
+
 fig = go.Figure()
 fig.add_trace(go.Candlestick(
-    x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"],
+    x=chart_df.index, open=chart_df["Open"], high=chart_df["High"], low=chart_df["Low"], close=chart_df["Close"],
     name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"
 ))
 
-if "Volume" in df.columns:
-    fig.add_trace(go.Bar(
-        x=df.index, y=df["Volume"], name="Volume", marker_color="lightblue",
-        yaxis="y2", opacity=0.3
-    ))
+if "Volume" in chart_df.columns:
+    fig.add_trace(go.Bar(x=chart_df.index, y=chart_df["Volume"], name="Volume", marker_color="lightblue", yaxis="y2", opacity=0.3))
 
-if show_sma and "SMA_FAST" in df.columns:
-    fig.add_trace(go.Scatter(x=df.index, y=df["SMA_FAST"], name="SMA Fast", line=dict(width=1, color="teal")))
-if show_sma and "SMA_SLOW" in df.columns:
-    fig.add_trace(go.Scatter(x=df.index, y=df["SMA_SLOW"], name="SMA Slow", line=dict(width=1, color="purple")))
-if show_supertrend and "SUPERTREND" in df.columns:
-    fig.add_trace(go.Scatter(x=df.index, y=df["SUPERTREND"], name="Supertrend", line=dict(width=1.5, color="magenta", dash="dot")))
+if not is_intraday:
+    if show_sma and "SMA_FAST" in chart_df.columns:
+        fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SMA_FAST"], name="SMA Fast", line=dict(width=1, color="teal")))
+    if show_sma and "SMA_SLOW" in chart_df.columns:
+        fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SMA_SLOW"], name="SMA Slow", line=dict(width=1, color="purple")))
+    if show_supertrend and "SUPERTREND" in chart_df.columns:
+        fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SUPERTREND"], name="Supertrend", line=dict(width=1.5, color="magenta", dash="dot")))
 
-if show_rule_signals:
-    buys, sells = df[df["SIGNAL"] == "BUY"], df[df["SIGNAL"] == "SELL"]
-    fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="BUY (rule)", marker=dict(color="lightgreen", size=7, symbol="triangle-up")))
-    fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="SELL (rule)", marker=dict(color="lightcoral", size=7, symbol="triangle-down")))
+    if show_rule_signals and "SIGNAL" in chart_df.columns:
+        buys, sells = chart_df[chart_df["SIGNAL"] == "BUY"], chart_df[chart_df["SIGNAL"] == "SELL"]
+        fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="BUY (rule)", marker=dict(color="lightgreen", size=7, symbol="triangle-up")))
+        fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="SELL (rule)", marker=dict(color="lightcoral", size=7, symbol="triangle-down")))
 
-if show_final_signals:
-    buy_points = df[df["FINAL_SIGNAL"] == "STRONG BUY"]
-    sell_points = df[df["FINAL_SIGNAL"] == "STRONG SELL"]
-    fig.add_trace(go.Scatter(
-        x=buy_points.index, y=buy_points["Low"] * 0.985, mode="markers+text", name="STRONG BUY",
-        marker=dict(symbol="triangle-up", size=18, color="#00c853", line=dict(width=1.5, color="darkgreen")),
-        text=["BUY"] * len(buy_points), textposition="bottom center", textfont=dict(color="darkgreen", size=10)
-    ))
-    fig.add_trace(go.Scatter(
-        x=sell_points.index, y=sell_points["High"] * 1.015, mode="markers+text", name="STRONG SELL",
-        marker=dict(symbol="triangle-down", size=18, color="#d50000", line=dict(width=1.5, color="darkred")),
-        text=["SELL"] * len(sell_points), textposition="top center", textfont=dict(color="darkred", size=10)
-    ))
+    if show_final_signals and "FINAL_SIGNAL" in chart_df.columns:
+        buy_points = chart_df[chart_df["FINAL_SIGNAL"] == "STRONG BUY"]
+        sell_points = chart_df[chart_df["FINAL_SIGNAL"] == "STRONG SELL"]
+        fig.add_trace(go.Scatter(
+            x=buy_points.index, y=buy_points["Low"] * 0.985, mode="markers+text", name="STRONG BUY",
+            marker=dict(symbol="triangle-up", size=18, color="#00c853", line=dict(width=1.5, color="darkgreen")),
+            text=["BUY"] * len(buy_points), textposition="bottom center", textfont=dict(color="darkgreen", size=10)
+        ))
+        fig.add_trace(go.Scatter(
+            x=sell_points.index, y=sell_points["High"] * 1.015, mode="markers+text", name="STRONG SELL",
+            marker=dict(symbol="triangle-down", size=18, color="#d50000", line=dict(width=1.5, color="darkred")),
+            text=["SELL"] * len(sell_points), textposition="top center", textfont=dict(color="darkred", size=10)
+        ))
 
-# Trade plan lines on the chart itself (stop-loss / target) for the latest signal
 if trade_plan is not None:
-    fig.add_hline(y=trade_plan["stop_loss"], line_dash="dash", line_color="red",
-                   annotation_text="Stop-Loss", annotation_position="top left")
-    fig.add_hline(y=trade_plan["target"], line_dash="dash", line_color="green",
-                   annotation_text="Target", annotation_position="bottom left")
+    fig.add_hline(y=trade_plan["stop_loss"], line_dash="dash", line_color="red", annotation_text="Stop-Loss", annotation_position="top left")
+    fig.add_hline(y=trade_plan["target"], line_dash="dash", line_color="green", annotation_text="Target", annotation_position="bottom left")
 
-# ---- Quick-zoom buttons based on ACTUAL trading-day rows in df ----
-n = len(df)
-full_start, full_end = df.index[0], df.index[-1]
+if is_intraday:
+    fig.update_xaxes(
+        rangebreaks=[
+            dict(bounds=["sat", "mon"]),
+            dict(bounds=[15.5, 9.25], pattern="hour"),
+        ],
+        rangeslider=dict(visible=False), type="date"
+    )
+else:
+    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], rangeslider=dict(visible=False), type="date")
 
-def window_start(num_rows):
-    idx = max(0, n - num_rows)
-    return df.index[idx]
-
-button_specs = [
-    ("1D", 5),
-    ("5D", 5),
-    ("1W", 5),
-    ("1M", 22),
-    ("3M", 66),
-    ("6M", 132),
-    ("9M", 198),
-    ("1Y", 264),
-]
-
-buttons = []
-for label, rows in button_specs:
-    buttons.append(dict(
-        label=label,
-        method="relayout",
-        args=[{"xaxis.range": [window_start(rows), full_end]}]
-    ))
-buttons.append(dict(
-    label="All",
-    method="relayout",
-    args=[{"xaxis.range": [full_start, full_end]}]
-))
-
-fig.update_layout(
-    updatemenus=[dict(
-        type="buttons",
-        direction="right",
-        x=0, xanchor="left",
-        y=1.12, yanchor="top",
-        showactive=True,
-        bgcolor="#f0f2f6",
-        buttons=buttons
-    )]
-)
-
-fig.update_xaxes(
-    rangebreaks=[dict(bounds=["sat", "mon"])],
-    rangeslider=dict(visible=False),
-    type="date"
-)
+# --- Force the price axis to zoom to the VISIBLE candles only ---
+# (Fixes a classic Plotly issue where zooming/slicing does not automatically
+#  rescale the y-axis, leaving old/wider historical price levels baked into
+#  the scale and squashing recent candles near the top of the chart.)
+price_high_series = pd.concat([
+    chart_df["High"],
+    pd.Series([trade_plan["stop_loss"], trade_plan["target"]]) if trade_plan is not None else pd.Series(dtype=float)
+])
+price_low_series = pd.concat([
+    chart_df["Low"],
+    pd.Series([trade_plan["stop_loss"], trade_plan["target"]]) if trade_plan is not None else pd.Series(dtype=float)
+])
+visible_high = chart_df["High"].max()
+visible_low = chart_df["Low"].min()
+price_padding = (visible_high - visible_low) * 0.08 if visible_high > visible_low else visible_high * 0.01
+y_range = [visible_low - price_padding, visible_high + price_padding]
 
 chart_height = 900 if fullscreen_mode else 700
-
 fig.update_layout(
-    title=f"{index_name} — {timeframe} Chart",
+    title=f"{index_name} — {range_choice} Chart" + (" (Intraday)" if is_intraday else f" ({timeframe})"),
     height=chart_height,
-    margin=dict(l=10, r=10, t=90, b=10),
-    yaxis=dict(title="Price"),
+    margin=dict(l=10, r=10, t=60, b=10),
+    yaxis=dict(title="Price", range=y_range, autorange=False),
     yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False),
     template="plotly_white",
     legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
 )
 
 st.plotly_chart(fig, use_container_width=True, config={
-    "displayModeBar": True,
-    "scrollZoom": True,
-    "responsive": True,
-    "doubleClick": "reset",
-    "displaylogo": False,
+    "displayModeBar": True, "scrollZoom": True, "responsive": True, "doubleClick": "reset", "displaylogo": False,
 })
 
 st.caption(
-    "💡 Buttons above the chart (1D/5D/1W/1M/3M/6M/9M/1Y/All) jump to that many "
-    "*actual trading sessions* of history so you always see real candles — no blank windows. "
-    "Dashed red/green lines show the current Stop-Loss/Target from the Trade Plan above. "
-    "Note: 1D/5D/1W look similar because the underlying data is daily candles, not live intraday ticks. "
-    "Drag directly on the chart or scroll to zoom to any custom range, double-click to reset."
+    "💡 1D/5D/1W now use real minute-level intraday data (auto-refreshes every 5 min while market is open). "
+    "1M and beyond use your daily swing data with SMA/Supertrend/signals overlaid. "
+    "The price axis is now locked to only the visible candles, so it will always fill the chart properly "
+    "instead of looking squashed. Dashed red/green lines = current Stop-Loss/Target from the Trade Plan above. "
+    "Intraday data depends on Yahoo Finance availability and may be limited outside market hours or for very old dates."
 )
 
 if fullscreen_mode:
-    st.info("Full-Screen Chart Mode is ON — other sections (metrics, logs, backtest) are hidden. Turn it off in the sidebar to see everything again.")
+    st.info("Full-Screen Chart Mode is ON — other sections are hidden. Turn it off in the sidebar to see everything again.")
     st.stop()
 
-# ============ EVERYTHING BELOW ONLY SHOWS WHEN NOT IN FULL-SCREEN MODE ============
+# ============ EVERYTHING BELOW: UNCHANGED, USES DAILY swing_df/full_df ============
+df = swing_df
 
 col1, col2, col3, col4 = st.columns(4)
 col1.metric("Latest Close", f"{latest['Close']:,.2f}")
-prev_close = df.iloc[-2]["Close"] if len(df) > 1 else latest["Close"]
-col2.metric(f"{timeframe} Change", f"{(latest['Close']/prev_close-1)*100:+.2f}%")
+prev_close = full_df.iloc[-2]["Close"] if len(full_df) > 1 else latest["Close"]
+col2.metric("Daily Change", f"{(latest['Close']/prev_close-1)*100:+.2f}%")
 col3.metric("Composite Score", f"{explain['composite']:+.2f}")
 color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[explain["decision"]]
 col4.markdown(f"<h4 style='color:{color};text-align:center'>Rule Engine: {explain['decision']}</h4>", unsafe_allow_html=True)
@@ -430,21 +393,20 @@ st_signal = latest["ST_SIGNAL"]
 st_color = {"BUY": "green", "SELL": "red", "HOLD": "gray"}[st_signal]
 sc3.markdown(f"<h4 style='color:{st_color};text-align:center'>Supertrend: {st_signal}</h4>", unsafe_allow_html=True)
 
-st.caption("STRONG BUY/SELL = both the rule engine and Supertrend+ADX agree. MIXED/CAUTION = they disagree, meaning conditions are less clear-cut today.")
+st.caption("STRONG BUY/SELL = both the rule engine and Supertrend+ADX agree. MIXED/CAUTION = they disagree.")
 log_df = logger.log_daily_signal(ticker, latest)
 accuracy, valid_count = logger.compute_accuracy(log_df)
 
 st.subheader("📒 Daily Signal Log & Track Record")
-
 if accuracy is not None:
     st.metric("Historical Accuracy (this app's own track record)", f"{accuracy:.1f}%", help=f"Based on {valid_count} completed signal days so far")
 else:
-    st.info("Not enough logged days yet to calculate accuracy. Check back after a few days of daily visits.")
+    st.info("Not enough logged days yet to calculate accuracy.")
 
 st.markdown("**Filter log:**")
 lf1, lf2 = st.columns([2, 1])
 with lf1:
-    search_term = st.text_input("Search log (matches any column, e.g. date, signal, index name)", "")
+    search_term = st.text_input("Search log (matches any column)", "")
 with lf2:
     signal_filter = st.multiselect(
         "Filter by signal",
@@ -456,20 +418,14 @@ filtered_log = log_df.copy()
 if signal_filter and "FINAL_SIGNAL" in filtered_log.columns:
     filtered_log = filtered_log[filtered_log["FINAL_SIGNAL"].isin(signal_filter)]
 if search_term:
-    mask_search = filtered_log.apply(
-        lambda row: row.astype(str).str.contains(search_term, case=False, na=False).any(), axis=1
-    )
+    mask_search = filtered_log.apply(lambda row: row.astype(str).str.contains(search_term, case=False, na=False).any(), axis=1)
     filtered_log = filtered_log[mask_search]
 
 st.dataframe(filtered_log.sort_values("date", ascending=False), use_container_width=True)
 
 csv_data = log_df.to_csv(index=False).encode("utf-8")
-st.download_button(
-    label="⬇️ Download signal log as CSV (backup)",
-    data=csv_data,
-    file_name="signal_log_backup.csv",
-    mime="text/csv"
-)
+st.download_button("⬇️ Download signal log as CSV (backup)", data=csv_data, file_name="signal_log_backup.csv", mime="text/csv")
+
 st.subheader("Why this signal?")
 st.dataframe(pd.DataFrame({
     "component": ["Trend", "Momentum(RSI)", "MACD", "Volatility(BB)", "Volume"],
@@ -490,7 +446,7 @@ eq_fig.add_trace(go.Scatter(x=result["equity_curve"].index, y=result["equity_cur
 st.plotly_chart(eq_fig, use_container_width=True)
 
 st.dataframe(
-    df[["Close", "RSI", "MACD", "SCORE", "SIGNAL", "ADX", "ST_SIGNAL", "FINAL_SIGNAL", "ATR14"]].tail(20).sort_index(ascending=False),
+    df[["Close", "RSI", "MACD", "SCORE", "SIGNAL", "ADX", "ST_SIGNAL", "FINAL_SIGNAL"]].tail(20).sort_index(ascending=False),
     use_container_width=True
 )
 
