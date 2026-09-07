@@ -14,10 +14,6 @@ import backtester
 st.set_page_config(page_title="Nifty & Sensex Daily Analyzer", layout="wide")
 
 # ============ AUTO-REFRESH SETUP (for Live Market Snapshot) ============
-# Tries the lightweight `streamlit-autorefresh` component first (silent rerun,
-# no full page reload -> smoothest experience). If that package isn't
-# installed on this deployment, falls back to a browser-level meta-refresh
-# reload so auto-refresh still works either way.
 AUTOREFRESH_AVAILABLE = False
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -30,12 +26,8 @@ st.markdown("""
         .block-container {padding-top: 1rem; padding-bottom: 1rem; padding-left: 1.5rem; padding-right: 1.5rem;}
         [data-testid="stMetricValue"] {font-size: 1.1rem;}
 
-        /* ============ MOBILE-RESPONSIVE FIXES ============ */
         @media (max-width: 768px) {
-            /* Tighter page padding so nothing gets cut off on small screens */
             .block-container {padding-left: 0.6rem; padding-right: 0.6rem; padding-top: 0.5rem;}
-
-            /* Force st.columns() rows to stack vertically instead of squeezing horizontally */
             div[data-testid="stHorizontalBlock"] {
                 flex-direction: column !important;
             }
@@ -44,26 +36,18 @@ st.markdown("""
                 min-width: 100% !important;
                 margin-bottom: 6px;
             }
-
-            /* Shrink metric numbers/labels so they don't overflow */
             [data-testid="stMetricValue"] {font-size: 1.3rem;}
             [data-testid="stMetricLabel"] {font-size: 0.8rem;}
             h1 {font-size: 1.4rem !important;}
             h2 {font-size: 1.15rem !important;}
             h3 {font-size: 1.0rem !important;}
-
-            /* Let the OHLC strip / Trade Plan flex rows wrap instead of overflowing */
             div[style*="display:flex"] {
                 flex-wrap: wrap !important;
                 row-gap: 6px;
             }
-
-            /* Make wide tables/dataframes horizontally scrollable instead of squeezing */
             [data-testid="stDataFrame"], [data-testid="stTable"] {
                 overflow-x: auto !important;
             }
-
-            /* Shrink the big Today's Signal banner text so it fits without wrapping oddly */
             div[style*="border-radius:10px"] h2 {font-size: 1.05rem !important;}
         }
     </style>
@@ -71,16 +55,8 @@ st.markdown("""
 
 st.info("📱 Tip: On mobile, tap the **>›** arrow at the top-left to open Settings (index choice, chart filters, position sizing).", icon="📱")
 
-# ============ LIVE KPI STRIP (Nifty & Sensex, near-real-time) ============
-# Placed at the very top of the page, above the title, so it's the first thing
-# visible on load - like the index ticker strip on Moneycontrol/NSE homepages.
-# It loops over ALL configured indices independently of the sidebar selection,
-# and does not require clicking "Fetch data & analyze" to appear.
-
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_live_quote(yf_ticker):
-    """Pulls the latest available 1-minute candle for a quick live-style KPI card.
-    Cached only 30s so repeated reruns/refreshes pick up new data quickly."""
     try:
         data = yf.download(yf_ticker, period="1d", interval="1m", progress=False)
         if data is None or data.empty:
@@ -92,7 +68,6 @@ def fetch_live_quote(yf_ticker):
         data = data.dropna(subset=["Close"])
         if data.empty:
             return None
-
         last_price = float(data["Close"].iloc[-1])
         day_high = float(data["High"].max())
         day_low = float(data["Low"].min())
@@ -222,7 +197,6 @@ with st.sidebar:
 
 ticker = cfg.INDICES[index_name]
 
-# ============ DAILY DATA (drives signals, backtest, trade plan - UNCHANGED) ============
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_and_process(ticker, period):
     raw = data_fetcher.fetch_history(ticker, period, cfg.INTERVAL)
@@ -244,15 +218,8 @@ def load_and_process(ticker, period):
     return scored
 
 
-# ============ INTRADAY DATA (chart display, for 1D/5D/1W) ============
-# NOW also runs the FULL indicator/signal pipeline on the intraday candles
-# themselves - this is what makes SMA/Supertrend/STRONG BUY-SELL markers show
-# up on the 1D/5D/1W charts, not just the daily swing charts (1M and beyond).
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_intraday(ticker, yf_period, yf_interval):
-    """Real minute-level candles for short-range chart zoom, WITH the same indicator/signal
-    engine applied as the daily data - so SMA/Supertrend/STRONG BUY-SELL markers also work
-    on 1D/5D/1W intraday charts, not just the daily swing charts."""
     try:
         data = yf.download(ticker, period=yf_period, interval=yf_interval, progress=False)
         if data is None or data.empty:
@@ -281,15 +248,12 @@ def fetch_intraday(ticker, yf_period, yf_interval):
             scored["FINAL_SIGNAL"] = scored.apply(combined, axis=1)
             return scored
         except Exception:
-            # If indicator calc fails (e.g. too few rows for some rolling window),
-            # fall back to plain candles so the chart still renders.
             return data
     except Exception:
         return None
 
 
 def resample_ohlc(data, tf):
-    """Resample daily-indexed data to Weekly/Monthly, NSE/Moneycontrol style."""
     if tf == "Daily":
         return data
     rule = "W" if tf == "Weekly" else "M"
@@ -365,6 +329,81 @@ def compute_trade_plan(latest_row, final_signal_val, atr_val):
     }
 
 
+def compute_btst_signal(full_df):
+    """
+    BTST = Buy Today, Sell Tomorrow (an NSE-specific overnight strategy exploiting
+    T+1 settlement: you buy near today's close and sell tomorrow, without waiting
+    for full delivery). This is HIGH RISK because you carry an overnight gap risk.
+
+    Rule fires when, on the latest completed candle:
+      - FINAL_SIGNAL == STRONG BUY (rule engine + Supertrend both bullish)
+      - Close is in the upper part of the day's range (strong close = follow-through likely)
+      - ADX >= 20 (real trend, not choppy/random)
+      - RSI is bullish but not extremely overbought (avoids chasing an exhausted move)
+
+    The historical win-rate below is backtested on your own loaded daily data:
+    every time this exact rule fired in the past, we check whether tomorrow's
+    OPEN and tomorrow's CLOSE were higher than today's close. This is NOT a
+    guarantee - it is a rule-based heuristic scored against your own history.
+    """
+    d = full_df.copy()
+    d["DAY_RANGE"] = (d["High"] - d["Low"]).replace(0, np.nan)
+    d["CLOSE_POSITION"] = ((d["Close"] - d["Low"]) / d["DAY_RANGE"]).clip(0, 1)
+
+    def rule_fires(row):
+        try:
+            return (
+                row.get("FINAL_SIGNAL") == "STRONG BUY"
+                and row.get("CLOSE_POSITION", 0) >= 0.65
+                and row.get("ADX", 0) >= 20
+                and 50 <= row.get("RSI", 50) <= 75
+            )
+        except Exception:
+            return False
+
+    d["BTST_RULE_FIRED"] = d.apply(rule_fires, axis=1)
+
+    # Backtest: for every historical day the rule fired, check next-day outcome
+    fired_idx = d.index[d["BTST_RULE_FIRED"]]
+    wins_open, wins_close, total_checked = 0, 0, 0
+    for ts in fired_idx:
+        loc = d.index.get_loc(ts)
+        if loc + 1 >= len(d):
+            continue  # no next day yet (e.g. today)
+        today_close = d.iloc[loc]["Close"]
+        next_open = d.iloc[loc + 1]["Open"]
+        next_close = d.iloc[loc + 1]["Close"]
+        total_checked += 1
+        if next_open > today_close:
+            wins_open += 1
+        if next_close > today_close:
+            wins_close += 1
+
+    win_rate_open = (wins_open / total_checked * 100) if total_checked else None
+    win_rate_close = (wins_close / total_checked * 100) if total_checked else None
+
+    latest_row = d.iloc[-1]
+    today_fires = bool(latest_row["BTST_RULE_FIRED"])
+
+    reasons = []
+    reasons.append(("STRONG BUY signal today", latest_row.get("FINAL_SIGNAL") == "STRONG BUY"))
+    reasons.append(("Strong close (upper 35% of day's range)", latest_row.get("CLOSE_POSITION", 0) >= 0.65))
+    reasons.append(("ADX >= 20 (real trend)", latest_row.get("ADX", 0) >= 20))
+    reasons.append(("RSI healthy 50-75 (bullish, not exhausted)", 50 <= latest_row.get("RSI", 50) <= 75))
+
+    return {
+        "fires_today": today_fires,
+        "reasons": reasons,
+        "close_position": latest_row.get("CLOSE_POSITION", np.nan),
+        "adx": latest_row.get("ADX", np.nan),
+        "rsi": latest_row.get("RSI", np.nan),
+        "entry": latest_row["Close"],
+        "total_checked": total_checked,
+        "win_rate_open": win_rate_open,
+        "win_rate_close": win_rate_close,
+    }
+
+
 if run_button or "last_df" not in st.session_state:
     try:
         st.session_state["last_df"] = load_and_process(ticker, period)
@@ -384,7 +423,6 @@ if swing_df.empty or len(swing_df) < 2:
     st.warning("Not enough data for this timeframe. Try Daily view or a longer History window.")
     st.stop()
 
-# Signals/confidence/trade-plan ALWAYS come from the real daily data (unaffected by chart zoom)
 latest = full_df.iloc[-1]
 explain = signal_engine.explain_latest(latest)
 final_signal = latest["FINAL_SIGNAL"]
@@ -423,13 +461,11 @@ else:
     position_size = int(risk_amount / trade_plan["risk_pts"]) if trade_plan["risk_pts"] > 0 else 0
     is_long = trade_plan["direction"] == "LONG"
 
-    # --- Card-level color coding: green wash for LONG, red/orange wash for SHORT ---
     card_bg = "#eafaf1" if is_long else "#fdf1ee"
     card_border = "#2e7d32" if is_long else "#c0392b"
     dir_color = "#1b7a3d" if is_long else "#c0392b"
     dir_icon = "📈" if is_long else "📉"
 
-    # --- Plain-English one-line summary, auto-generated from the numbers ---
     action_word = "buying (going long)" if is_long else "shorting (going short)"
     summary_sentence = (
         f"The system currently believes <b>{index_name}</b> is heading "
@@ -460,7 +496,6 @@ else:
     tp6.metric("Risk per unit", f"{trade_plan['risk_pts']:,.2f} pts")
     tp7.metric(f"Suggested Position Size (risking {risk_pct}% of ₹{capital:,.0f})", f"{position_size:,} units")
 
-    # --- Horizontal Risk/Reward visual bar: Stop-Loss (red) <--- Entry ---> Target (green) ---
     if is_long:
         low_pt, mid_pt, high_pt = trade_plan["stop_loss"], trade_plan["entry"], trade_plan["target"]
         low_label, high_label = "Stop-Loss", "Target"
@@ -499,6 +534,55 @@ else:
         f"Stop-loss = 1.5× ATR({latest['ATR14']:.1f}) from entry (tightened to Supertrend if closer). "
         f"Target = 3× ATR (built-in 1:2 risk-reward). Not investment advice."
     )
+
+# ============ 🌙 BTST SIGNAL (Buy Today, Sell Tomorrow) ============
+st.subheader("🌙 BTST Signal (Buy Today, Sell Tomorrow)")
+btst = compute_btst_signal(full_df)
+
+btst_bg = "#eafaf1" if btst["fires_today"] else "#f5f5f5"
+btst_border = "#2e7d32" if btst["fires_today"] else "#bbbbbb"
+btst_headline = "✅ BTST CANDIDATE TODAY" if btst["fires_today"] else "❌ Not a BTST candidate today"
+btst_headline_color = "#1b7a3d" if btst["fires_today"] else "#666666"
+
+st.markdown(
+    f"""
+    <div style='background-color:{btst_bg};border:1.5px solid {btst_border};border-radius:12px;padding:14px 18px;margin-bottom:8px'>
+        <h4 style='margin:0;color:{btst_headline_color}'>{btst_headline}</h4>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+bc1, bc2 = st.columns([1.3, 1])
+with bc1:
+    st.markdown("**Rule checklist for today:**")
+    for label, passed in btst["reasons"]:
+        icon = "✅" if passed else "❌"
+        st.markdown(f"{icon} {label}")
+with bc2:
+    if btst["total_checked"] and btst["win_rate_open"] is not None:
+        st.metric("Historical win-rate (next-day OPEN higher)", f"{btst['win_rate_open']:.1f}%",
+                   help=f"Backtested on {btst['total_checked']} past occurrences of this exact rule in your loaded history.")
+        st.metric("Historical win-rate (next-day CLOSE higher)", f"{btst['win_rate_close']:.1f}%")
+    else:
+        st.info("Not enough historical occurrences of this rule yet in the loaded data to compute a win-rate.")
+
+if btst["fires_today"]:
+    btst_target = btst["entry"] * 1.010
+    btst_stop = btst["entry"] * 0.995
+    bt1, bt2, bt3 = st.columns(3)
+    bt1.metric("Suggested BTST Entry (near today's close)", f"{btst['entry']:,.2f}")
+    bt2.metric("Suggested overnight Target (~+1.0%)", f"{btst_target:,.2f}")
+    bt3.metric("Suggested overnight Stop (~-0.5%)", f"{btst_stop:,.2f}")
+
+st.caption(
+    "⚠️ BTST (Buy Today, Sell Tomorrow) means buying near today's close and selling tomorrow "
+    "morning/early session, exploiting NSE's T+1 settlement without waiting for full delivery. "
+    "This carries real OVERNIGHT GAP RISK — global news, SGX Nifty/GIFT Nifty cues, or a bad open "
+    "can move price against you before you can react. The win-rate above is a historical backtest "
+    "of this exact rule on your own loaded data, NOT a live-verified track record and NOT a guarantee. "
+    "Use small size and always set your stop before market open. Not investment advice."
+)
 
 # ============ CHART RANGE SELECTOR (drives which data source is used) ============
 st.markdown("### 📊 Chart")
@@ -539,7 +623,6 @@ else:
 
 st.caption(f"ℹ️ {data_note}")
 
-# --- TradingView-style OHLC quote strip above the chart ---
 o_val = float(chart_df["Open"].iloc[0])
 h_val = float(chart_df["High"].max())
 l_val = float(chart_df["Low"].min())
@@ -576,7 +659,6 @@ fig.add_trace(go.Candlestick(
 if show_volume and "Volume" in chart_df.columns:
     fig.add_trace(go.Bar(x=chart_df.index, y=chart_df["Volume"], name="Volume", marker_color="#b2b5be", yaxis="y2", opacity=0.35))
 
-# --- Dotted current-price line, TradingView style ---
 last_price = float(chart_df["Close"].iloc[-1])
 last_price_color = "#089981" if chg_val >= 0 else "#f23645"
 fig.add_hline(
@@ -585,9 +667,6 @@ fig.add_hline(
     annotation=dict(font=dict(color="white", size=11), bgcolor=last_price_color, bordercolor=last_price_color)
 )
 
-# NOTE: these overlays now run on BOTH daily and intraday chart_df, since
-# fetch_intraday() computes the same SMA/Supertrend/signal columns as the
-# daily pipeline. This is what makes BUY/SELL markers show up on 1D/5D/1W too.
 if show_sma and "SMA_FAST" in chart_df.columns:
     fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SMA_FAST"], name="SMA Fast", line=dict(width=1, color="teal")))
 if show_sma and "SMA_SLOW" in chart_df.columns:
@@ -629,7 +708,6 @@ if is_intraday:
 else:
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], rangeslider=dict(visible=False), type="date")
 
-# --- Force the price axis to zoom to the VISIBLE candles only ---
 visible_high = chart_df["High"].max()
 visible_low = chart_df["Low"].min()
 price_padding = (visible_high - visible_low) * 0.08 if visible_high > visible_low else visible_high * 0.01
@@ -675,7 +753,6 @@ if fullscreen_mode:
     st.info("Full-Screen Chart Mode is ON — other sections are hidden. Turn it off in the sidebar to see everything again.")
     st.stop()
 
-# ============ EVERYTHING BELOW: UNCHANGED, USES DAILY swing_df/full_df ============
 df = swing_df
 
 col1, col2, col3, col4 = st.columns(4)
