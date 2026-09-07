@@ -368,8 +368,9 @@ st.markdown("### 📊 Chart")
 range_choice = st.radio(
     "Select range",
     ["1D", "5D", "1W", "1M", "3M", "6M", "9M", "1Y", "All"],
-    index=8, horizontal=True,
-    help="1D/5D/1W load REAL intraday candles (minute-level). 1M and beyond use daily candles from your swing data."
+    index=0, horizontal=True,
+    help="1D/5D/1W load REAL intraday candles (minute-level). 1M and beyond use daily candles from your swing data. "
+         "Defaults to 1D on page load so the chart isn't cluttered with years of candles."
 )
 
 intraday_map = {
@@ -401,14 +402,51 @@ else:
 
 st.caption(f"ℹ️ {data_note}")
 
+# --- TradingView-style OHLC quote strip above the chart ---
+o_val = float(chart_df["Open"].iloc[0])
+h_val = float(chart_df["High"].max())
+l_val = float(chart_df["Low"].min())
+c_val = float(chart_df["Close"].iloc[-1])
+chg_val = c_val - o_val
+chg_pct = (chg_val / o_val * 100) if o_val else 0
+quote_color = "#089981" if chg_val >= 0 else "#f23645"
+
+st.markdown(
+    f"""
+    <div style='display:flex;align-items:center;gap:18px;padding:6px 4px;font-family:monospace;font-size:14px;color:#333'>
+        <b style='font-size:15px;color:#111'>{index_name}</b>
+        <span>O <b>{o_val:,.2f}</b></span>
+        <span>H <b>{h_val:,.2f}</b></span>
+        <span>L <b>{l_val:,.2f}</b></span>
+        <span>C <b>{c_val:,.2f}</b></span>
+        <span style='color:{quote_color};font-weight:bold'>{chg_val:+,.2f} ({chg_pct:+.2f}%)</span>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+show_volume = st.checkbox("Show Volume bars", value=False, key="show_volume_toggle",
+                            help="Off by default for a cleaner TradingView-style price chart.")
+
 fig = go.Figure()
 fig.add_trace(go.Candlestick(
     x=chart_df.index, open=chart_df["Open"], high=chart_df["High"], low=chart_df["Low"], close=chart_df["Close"],
-    name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"
+    name="Price", increasing_line_color="#089981", decreasing_line_color="#f23645",
+    increasing_fillcolor="#089981", decreasing_fillcolor="#f23645",
+    line=dict(width=1)
 ))
 
-if "Volume" in chart_df.columns:
-    fig.add_trace(go.Bar(x=chart_df.index, y=chart_df["Volume"], name="Volume", marker_color="lightblue", yaxis="y2", opacity=0.3))
+if show_volume and "Volume" in chart_df.columns:
+    fig.add_trace(go.Bar(x=chart_df.index, y=chart_df["Volume"], name="Volume", marker_color="#b2b5be", yaxis="y2", opacity=0.35))
+
+# --- Dotted current-price line, TradingView style ---
+last_price = float(chart_df["Close"].iloc[-1])
+last_price_color = "#089981" if chg_val >= 0 else "#f23645"
+fig.add_hline(
+    y=last_price, line_dash="dot", line_color=last_price_color, line_width=1,
+    annotation_text=f"{last_price:,.2f}", annotation_position="right",
+    annotation=dict(font=dict(color="white", size=11), bgcolor=last_price_color, bordercolor=last_price_color)
+)
 
 if not is_intraday:
     if show_sma and "SMA_FAST" in chart_df.columns:
@@ -460,13 +498,20 @@ y_range = [visible_low - price_padding, visible_high + price_padding]
 
 chart_height = 900 if fullscreen_mode else 700
 fig.update_layout(
-    title=f"{index_name} — {range_choice} Chart" + (" (Intraday)" if is_intraday else f" ({timeframe})"),
     height=chart_height,
-    margin=dict(l=10, r=10, t=60, b=10),
-    yaxis=dict(title="Price", range=y_range, autorange=False),
-    yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False),
+    margin=dict(l=10, r=55, t=25, b=10),
+    yaxis=dict(
+        title=None, range=y_range, autorange=False, side="right",
+        showgrid=True, gridcolor="#eeeeee", gridwidth=1,
+        tickformat=",.0f", zeroline=False
+    ),
+    yaxis2=dict(title=None, overlaying="y", side="left", showgrid=False, visible=show_volume),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
     template="plotly_white",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    showlegend=False,
+    hovermode="x unified",
+    xaxis=dict(showgrid=True, gridcolor="#f2f2f2"),
 )
 
 st.plotly_chart(fig, use_container_width=True, config={
@@ -476,7 +521,7 @@ st.plotly_chart(fig, use_container_width=True, config={
 st.caption(
     "💡 1D/5D/1W now use real minute-level intraday data. 1M and beyond use your daily swing data with "
     "SMA/Supertrend/signals overlaid. The price axis is locked to only the visible candles so it always "
-    "fills the chart properly. Dashed red/green lines = current Stop-Loss/Target from the Trade Plan above."
+    "fills the chart properly. The dotted line = last traded price. Dashed red/green lines = current Stop-Loss/Target from the Trade Plan above."
 )
 
 if fullscreen_mode:
