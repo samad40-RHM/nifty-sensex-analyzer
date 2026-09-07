@@ -465,7 +465,12 @@ with st.sidebar:
     st.header("Settings")
     index_name = st.selectbox("Index", list(cfg.INDICES.keys()))
     period = st.selectbox("History window", ["1y", "2y", "5y", "10y", "max"], index=2)
-    allow_short = st.checkbox("Allow SELL signals in backtest", value=True)
+    allow_short = st.checkbox(
+        "Include SHORT trades (SELL signals)",
+        value=True,
+        help="BUY signals are always simulated. Check this to ALSO simulate shorting on STRONG SELL "
+             "signals in the backtest. Uncheck for a long-only backtest."
+    )
     run_button = st.button("Fetch data & analyze", type="primary")
 
     st.markdown("---")
