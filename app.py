@@ -29,8 +29,47 @@ st.markdown("""
     <style>
         .block-container {padding-top: 1rem; padding-bottom: 1rem; padding-left: 1.5rem; padding-right: 1.5rem;}
         [data-testid="stMetricValue"] {font-size: 1.1rem;}
+
+        /* ============ MOBILE-RESPONSIVE FIXES ============ */
+        @media (max-width: 768px) {
+            /* Tighter page padding so nothing gets cut off on small screens */
+            .block-container {padding-left: 0.6rem; padding-right: 0.6rem; padding-top: 0.5rem;}
+
+            /* Force st.columns() rows to stack vertically instead of squeezing horizontally */
+            div[data-testid="stHorizontalBlock"] {
+                flex-direction: column !important;
+            }
+            div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+                width: 100% !important;
+                min-width: 100% !important;
+                margin-bottom: 6px;
+            }
+
+            /* Shrink metric numbers/labels so they don't overflow */
+            [data-testid="stMetricValue"] {font-size: 1.3rem;}
+            [data-testid="stMetricLabel"] {font-size: 0.8rem;}
+            h1 {font-size: 1.4rem !important;}
+            h2 {font-size: 1.15rem !important;}
+            h3 {font-size: 1.0rem !important;}
+
+            /* Let the OHLC strip / Trade Plan flex rows wrap instead of overflowing */
+            div[style*="display:flex"] {
+                flex-wrap: wrap !important;
+                row-gap: 6px;
+            }
+
+            /* Make wide tables/dataframes horizontally scrollable instead of squeezing */
+            [data-testid="stDataFrame"], [data-testid="stTable"] {
+                overflow-x: auto !important;
+            }
+
+            /* Shrink the big Today's Signal banner text so it fits without wrapping oddly */
+            div[style*="border-radius:10px"] h2 {font-size: 1.05rem !important;}
+        }
     </style>
 """, unsafe_allow_html=True)
+
+st.info("📱 Tip: On mobile, tap the **>›** arrow at the top-left to open Settings (index choice, chart filters, position sizing).", icon="📱")
 
 # ============ LIVE KPI STRIP (Nifty & Sensex, near-real-time) ============
 # Placed at the very top of the page, above the title, so it's the first thing
@@ -169,6 +208,11 @@ with st.sidebar:
         "🖥️ Full-Screen Chart Mode",
         value=False,
         help="Hides everything except the chart so you can analyze it in maximum space."
+    )
+    compact_mobile = st.checkbox(
+        "📱 Compact Mobile View",
+        value=False,
+        help="Shrinks the chart height and simplifies spacing for small phone screens. Turn this on if you're viewing on a mobile device."
     )
 
     st.markdown("---")
@@ -591,7 +635,12 @@ visible_low = chart_df["Low"].min()
 price_padding = (visible_high - visible_low) * 0.08 if visible_high > visible_low else visible_high * 0.01
 y_range = [visible_low - price_padding, visible_high + price_padding]
 
-chart_height = 900 if fullscreen_mode else 700
+if fullscreen_mode:
+    chart_height = 900
+elif compact_mobile:
+    chart_height = 420
+else:
+    chart_height = 700
 fig.update_layout(
     height=chart_height,
     margin=dict(l=10, r=55, t=25, b=10),
