@@ -329,28 +329,18 @@ def compute_trade_plan(latest_row, final_signal_val, atr_val):
     }
 
 
-def compute_btst_signal(full_df):
+def compute_btst_signal(full_df, atr_val):
     """
-    BTST = Buy Today, Sell Tomorrow (an NSE-specific overnight strategy exploiting
-    T+1 settlement: you buy near today's close and sell tomorrow, without waiting
-    for full delivery). This is HIGH RISK because you carry an overnight gap risk.
-
-    Rule fires when, on the latest completed candle:
-      - FINAL_SIGNAL == STRONG BUY (rule engine + Supertrend both bullish)
-      - Close is in the upper part of the day's range (strong close = follow-through likely)
-      - ADX >= 20 (real trend, not choppy/random)
-      - RSI is bullish but not extremely overbought (avoids chasing an exhausted move)
-
-    The historical win-rate below is backtested on your own loaded daily data:
-    every time this exact rule fired in the past, we check whether tomorrow's
-    OPEN and tomorrow's CLOSE were higher than today's close. This is NOT a
-    guarantee - it is a rule-based heuristic scored against your own history.
+    BTST = Buy Today, Sell Tomorrow (NSE T+1 settlement overnight strategy).
+    Returns a CALL / PUT / WAIT verdict (options-style directional wording) plus
+    numeric predicted levels for tomorrow, and a historical win-rate backtested
+    on the user's own loaded data for the strict "strong setup" rule.
     """
     d = full_df.copy()
     d["DAY_RANGE"] = (d["High"] - d["Low"]).replace(0, np.nan)
     d["CLOSE_POSITION"] = ((d["Close"] - d["Low"]) / d["DAY_RANGE"]).clip(0, 1)
 
-    def rule_fires(row):
+    def rule_fires_bull(row):
         try:
             return (
                 row.get("FINAL_SIGNAL") == "STRONG BUY"
@@ -361,46 +351,108 @@ def compute_btst_signal(full_df):
         except Exception:
             return False
 
-    d["BTST_RULE_FIRED"] = d.apply(rule_fires, axis=1)
+    def rule_fires_bear(row):
+        try:
+            return (
+                row.get("FINAL_SIGNAL") == "STRONG SELL"
+                and row.get("CLOSE_POSITION", 1) <= 0.35
+                and row.get("ADX", 0) >= 20
+                and 25 <= row.get("RSI", 50) <= 50
+            )
+        except Exception:
+            return False
 
-    # Backtest: for every historical day the rule fired, check next-day outcome
-    fired_idx = d.index[d["BTST_RULE_FIRED"]]
+    d["BTST_BULL_FIRED"] = d.apply(rule_fires_bull, axis=1)
+    d["BTST_BEAR_FIRED"] = d.apply(rule_fires_bear, axis=1)
+
+    latest_row = d.iloc[-1]
+    bull_today = bool(latest_row["BTST_BULL_FIRED"])
+    bear_today = bool(latest_row["BTST_BEAR_FIRED"])
+
+    if bull_today:
+        call = "CALL"
+        fired_mask = d["BTST_BULL_FIRED"]
+    elif bear_today:
+        call = "PUT"
+        fired_mask = d["BTST_BEAR_FIRED"]
+    else:
+        call = "WAIT"
+        fired_mask = pd.Series(False, index=d.index)
+
+    fired_idx = d.index[fired_mask]
     wins_open, wins_close, total_checked = 0, 0, 0
     for ts in fired_idx:
         loc = d.index.get_loc(ts)
         if loc + 1 >= len(d):
-            continue  # no next day yet (e.g. today)
+            continue
         today_close = d.iloc[loc]["Close"]
         next_open = d.iloc[loc + 1]["Open"]
         next_close = d.iloc[loc + 1]["Close"]
         total_checked += 1
-        if next_open > today_close:
-            wins_open += 1
-        if next_close > today_close:
-            wins_close += 1
+        is_bull = d.iloc[loc]["BTST_BULL_FIRED"]
+        if is_bull:
+            if next_open > today_close:
+                wins_open += 1
+            if next_close > today_close:
+                wins_close += 1
+        else:
+            if next_open < today_close:
+                wins_open += 1
+            if next_close < today_close:
+                wins_close += 1
 
     win_rate_open = (wins_open / total_checked * 100) if total_checked else None
     win_rate_close = (wins_close / total_checked * 100) if total_checked else None
 
-    latest_row = d.iloc[-1]
-    today_fires = bool(latest_row["BTST_RULE_FIRED"])
+    entry = float(latest_row["Close"])
+    if pd.isna(atr_val) or atr_val <= 0:
+        atr_val = entry * 0.008
+    move = max(atr_val * 0.8, entry * 0.004)
+
+    if call == "CALL":
+        pred_target = entry + move
+        pred_stop = entry - move * 0.5
+    elif call == "PUT":
+        pred_target = entry - move
+        pred_stop = entry + move * 0.5
+    else:
+        pred_target = entry
+        pred_stop = entry
 
     reasons = []
-    reasons.append(("STRONG BUY signal today", latest_row.get("FINAL_SIGNAL") == "STRONG BUY"))
-    reasons.append(("Strong close (upper 35% of day's range)", latest_row.get("CLOSE_POSITION", 0) >= 0.65))
-    reasons.append(("ADX >= 20 (real trend)", latest_row.get("ADX", 0) >= 20))
-    reasons.append(("RSI healthy 50-75 (bullish, not exhausted)", 50 <= latest_row.get("RSI", 50) <= 75))
+    if call == "CALL":
+        reasons = [
+            ("STRONG BUY signal today", True),
+            ("Strong close (upper 35% of range)", latest_row.get("CLOSE_POSITION", 0) >= 0.65),
+            ("ADX >= 20 (real trend)", latest_row.get("ADX", 0) >= 20),
+            ("RSI healthy 50-75", 50 <= latest_row.get("RSI", 50) <= 75),
+        ]
+    elif call == "PUT":
+        reasons = [
+            ("STRONG SELL signal today", True),
+            ("Weak close (lower 35% of range)", latest_row.get("CLOSE_POSITION", 1) <= 0.35),
+            ("ADX >= 20 (real trend)", latest_row.get("ADX", 0) >= 20),
+            ("RSI weak 25-50", 25 <= latest_row.get("RSI", 50) <= 50),
+        ]
+    else:
+        reasons = [
+            ("STRONG BUY signal today", latest_row.get("FINAL_SIGNAL") == "STRONG BUY"),
+            ("STRONG SELL signal today", latest_row.get("FINAL_SIGNAL") == "STRONG SELL"),
+            ("ADX >= 20 (real trend)", latest_row.get("ADX", 0) >= 20),
+        ]
 
     return {
-        "fires_today": today_fires,
+        "call": call,
+        "entry": entry,
+        "pred_target": pred_target,
+        "pred_stop": pred_stop,
+        "total_checked": total_checked,
+        "win_rate_open": win_rate_open,
+        "win_rate_close": win_rate_close,
         "reasons": reasons,
         "close_position": latest_row.get("CLOSE_POSITION", np.nan),
         "adx": latest_row.get("ADX", np.nan),
         "rsi": latest_row.get("RSI", np.nan),
-        "entry": latest_row["Close"],
-        "total_checked": total_checked,
-        "win_rate_open": win_rate_open,
-        "win_rate_close": win_rate_close,
     }
 
 
@@ -535,53 +587,86 @@ else:
         f"Target = 3× ATR (built-in 1:2 risk-reward). Not investment advice."
     )
 
-# ============ 🌙 BTST SIGNAL (Buy Today, Sell Tomorrow) ============
-st.subheader("🌙 BTST Signal (Buy Today, Sell Tomorrow)")
-btst = compute_btst_signal(full_df)
+# ============ 🌙 BTST SIGNAL — BOTH NIFTY & SENSEX SIDE BY SIDE ============
+st.subheader("🌙 BTST Signal for Tomorrow — Nifty & Sensex")
+st.caption("Buy Today, Sell Tomorrow. Short, numeric view for BOTH indices — with a clear CALL / PUT / WAIT verdict.")
 
-btst_bg = "#eafaf1" if btst["fires_today"] else "#f5f5f5"
-btst_border = "#2e7d32" if btst["fires_today"] else "#bbbbbb"
-btst_headline = "✅ BTST CANDIDATE TODAY" if btst["fires_today"] else "❌ Not a BTST candidate today"
-btst_headline_color = "#1b7a3d" if btst["fires_today"] else "#666666"
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_for_btst(ticker_, period_):
+    raw = data_fetcher.fetch_history(ticker_, period_, cfg.INTERVAL)
+    enriched = indicators.add_all_indicators(raw)
+    enriched = indicators.add_supertrend_adx(enriched)
+    scored = signal_engine.annotate_signals(enriched)
+    scored["ST_SIGNAL"] = scored.apply(signal_engine.supertrend_adx_signal, axis=1)
 
-st.markdown(
-    f"""
-    <div style='background-color:{btst_bg};border:1.5px solid {btst_border};border-radius:12px;padding:14px 18px;margin-bottom:8px'>
-        <h4 style='margin:0;color:{btst_headline_color}'>{btst_headline}</h4>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    def combined(r):
+        if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY":
+            return "STRONG BUY"
+        if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL":
+            return "STRONG SELL"
+        if r["SIGNAL"] == "HOLD" and r["ST_SIGNAL"] == "HOLD":
+            return "HOLD"
+        return "MIXED / CAUTION"
 
-bc1, bc2 = st.columns([1.3, 1])
-with bc1:
-    st.markdown("**Rule checklist for today:**")
-    for label, passed in btst["reasons"]:
-        icon = "✅" if passed else "❌"
-        st.markdown(f"{icon} {label}")
-with bc2:
-    if btst["total_checked"] and btst["win_rate_open"] is not None:
-        st.metric("Historical win-rate (next-day OPEN higher)", f"{btst['win_rate_open']:.1f}%",
-                   help=f"Backtested on {btst['total_checked']} past occurrences of this exact rule in your loaded history.")
-        st.metric("Historical win-rate (next-day CLOSE higher)", f"{btst['win_rate_close']:.1f}%")
-    else:
-        st.info("Not enough historical occurrences of this rule yet in the loaded data to compute a win-rate.")
+    scored["FINAL_SIGNAL"] = scored.apply(combined, axis=1)
+    scored["ATR14"] = compute_atr(scored, period=14)
+    return scored
 
-if btst["fires_today"]:
-    btst_target = btst["entry"] * 1.010
-    btst_stop = btst["entry"] * 0.995
-    bt1, bt2, bt3 = st.columns(3)
-    bt1.metric("Suggested BTST Entry (near today's close)", f"{btst['entry']:,.2f}")
-    bt2.metric("Suggested overnight Target (~+1.0%)", f"{btst_target:,.2f}")
-    bt3.metric("Suggested overnight Stop (~-0.5%)", f"{btst_stop:,.2f}")
+btst_cols = st.columns(len(cfg.INDICES))
+for col, (idx_nm, idx_tk) in zip(btst_cols, cfg.INDICES.items()):
+    with col:
+        try:
+            if idx_nm == index_name:
+                df_for_btst = full_df  # reuse already-loaded data, avoid a second fetch
+            else:
+                df_for_btst = load_for_btst(idx_tk, period)
+            atr_latest = df_for_btst["ATR14"].iloc[-1]
+            btst = compute_btst_signal(df_for_btst, atr_latest)
+        except Exception as e:
+            st.warning(f"{idx_nm}: BTST unavailable ({e})")
+            continue
+
+        call = btst["call"]
+        if call == "CALL":
+            bg, border, txt_color, icon = "#eafaf1", "#2e7d32", "#1b7a3d", "📈"
+            headline = "CALL (bullish overnight)"
+        elif call == "PUT":
+            bg, border, txt_color, icon = "#fdf1ee", "#c0392b", "#c0392b", "📉"
+            headline = "PUT (bearish overnight)"
+        else:
+            bg, border, txt_color, icon = "#f5f5f5", "#bbbbbb", "#666666", "⏸️"
+            headline = "WAIT (no clear edge)"
+
+        win_open = f"{btst['win_rate_open']:.0f}%" if btst["win_rate_open"] is not None else "N/A"
+        win_close = f"{btst['win_rate_close']:.0f}%" if btst["win_rate_close"] is not None else "N/A"
+
+        st.markdown(
+            f"""
+            <div style='background-color:{bg};border:1.5px solid {border};border-radius:12px;padding:14px 16px'>
+                <h4 style='margin:0;color:#333'>{idx_nm}</h4>
+                <h2 style='margin:4px 0;color:{txt_color}'>{icon} {headline}</h2>
+                <table style='width:100%;font-size:13.5px;color:#333;border-collapse:collapse'>
+                    <tr><td style='padding:3px 0;color:#777'>Today's Close</td><td style='text-align:right;font-weight:bold'>{btst['entry']:,.2f}</td></tr>
+                    <tr><td style='padding:3px 0;color:#777'>Predicted Tomorrow Target</td><td style='text-align:right;font-weight:bold;color:{txt_color}'>{btst['pred_target']:,.2f}</td></tr>
+                    <tr><td style='padding:3px 0;color:#777'>Predicted Tomorrow Stop</td><td style='text-align:right;font-weight:bold'>{btst['pred_stop']:,.2f}</td></tr>
+                    <tr><td style='padding:6px 0 0 0;color:#777'>Win-rate (next OPEN)</td><td style='text-align:right;padding-top:6px'>{win_open}</td></tr>
+                    <tr><td style='padding:3px 0;color:#777'>Win-rate (next CLOSE)</td><td style='text-align:right'>{win_close}</td></tr>
+                </table>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        with st.expander(f"Why this {call} call for {idx_nm}?"):
+            for label, passed in btst["reasons"]:
+                st.markdown(f"{'✅' if passed else '❌'} {label}")
+            st.caption(f"Backtested on {btst['total_checked']} similar past setups in loaded history.")
 
 st.caption(
-    "⚠️ BTST (Buy Today, Sell Tomorrow) means buying near today's close and selling tomorrow "
-    "morning/early session, exploiting NSE's T+1 settlement without waiting for full delivery. "
-    "This carries real OVERNIGHT GAP RISK — global news, SGX Nifty/GIFT Nifty cues, or a bad open "
-    "can move price against you before you can react. The win-rate above is a historical backtest "
-    "of this exact rule on your own loaded data, NOT a live-verified track record and NOT a guarantee. "
-    "Use small size and always set your stop before market open. Not investment advice."
+    "⚠️ CALL = bullish overnight bias, PUT = bearish overnight bias, WAIT = no clear edge today. "
+    "Predicted Target/Stop are ATR-based overnight estimates, not guarantees. BTST carries real gap risk "
+    "from global cues (SGX/GIFT Nifty) before the next session opens. Win-rates are historical backtests on "
+    "your own loaded data, not a live-verified record. Use small size, set your stop before market open. "
+    "Not investment advice."
 )
 
 # ============ CHART RANGE SELECTOR (drives which data source is used) ============
