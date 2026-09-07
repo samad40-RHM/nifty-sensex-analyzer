@@ -4,6 +4,8 @@ import numpy as np
 import plotly.graph_objects as go
 import yfinance as yf
 import datetime
+import urllib.request
+import xml.etree.ElementTree as ET
 import logger
 import config as cfg
 import data_fetcher
@@ -12,6 +14,231 @@ import signal_engine
 import backtester
 
 st.set_page_config(page_title="Nifty & Sensex Daily Analyzer", layout="wide")
+
+# ============================================================================
+# 🌍 GLOBAL MARKET PULSE — overnight global cues that drive tomorrow's Indian
+# market open (US close, Europe close, Asia live during IST morning, crude
+# oil, dollar index/rupee) + a curated headline feed. Placed at the very top
+# so it's the first thing you see on refresh, before anything else loads.
+# ============================================================================
+
+GLOBAL_TICKERS = {
+    "🇺🇸 US": {
+        "S&P 500": "^GSPC",
+        "Dow Jones": "^DJI",
+        "Nasdaq": "^IXIC",
+    },
+    "🇪🇺 Europe": {
+        "FTSE 100": "^FTSE",
+        "DAX (Germany)": "^GDAXI",
+        "CAC 40 (France)": "^FCHI",
+    },
+    "🌏 Asia": {
+        "Nikkei 225 (Japan)": "^N225",
+        "Hang Seng (HK)": "^HSI",
+        "Shanghai Comp. (China)": "000001.SS",
+    },
+    "🛢️ Commodities & FX": {
+        "Crude Oil (WTI)": "CL=F",
+        "Dollar Index": "DX-Y.NYB",
+        "USD/INR": "INR=X",
+    },
+}
+
+@st.cache_data(ttl=240, show_spinner=False)
+def fetch_global_snapshot():
+    """Pulls latest close + % change for each global market/commodity that
+    typically influences the next Indian trading session's opening gap."""
+    results = {}
+    for group, tickers in GLOBAL_TICKERS.items():
+        group_results = {}
+        for label, tk in tickers.items():
+            try:
+                data = yf.download(tk, period="5d", interval="1d", progress=False)
+                if data is None or data.empty:
+                    group_results[label] = None
+                    continue
+                if isinstance(data.columns, pd.MultiIndex):
+                    data.columns = data.columns.get_level_values(0)
+                data = data.dropna(subset=["Close"])
+                if len(data) < 2:
+                    group_results[label] = None
+                    continue
+                last_close = float(data["Close"].iloc[-1])
+                prev_close = float(data["Close"].iloc[-2])
+                chg_pct = (last_close - prev_close) / prev_close * 100 if prev_close else 0
+                last_date = data.index[-1]
+                group_results[label] = {"price": last_close, "pct": chg_pct, "date": last_date}
+            except Exception:
+                group_results[label] = None
+        results[group] = group_results
+    return results
+
+
+@st.cache_data(ttl=480, show_spinner=False)
+def fetch_global_headlines(max_items=6):
+    """Pulls top market-moving headlines from public, no-auth-required RSS
+    feeds (Economic Times Markets + Reuters-style world/business feeds).
+    Uses only Python's built-in urllib/ElementTree - no extra dependency
+    needs to be added to requirements.txt."""
+    feeds = [
+        "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+        "https://www.moneycontrol.com/rss/marketreports.xml",
+        "https://www.moneycontrol.com/rss/business.xml",
+    ]
+    headlines = []
+    for url in feeds:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                raw = resp.read()
+            root = ET.fromstring(raw)
+            for item in root.findall(".//item")[:max_items]:
+                title_el = item.find("title")
+                link_el = item.find("link")
+                pub_el = item.find("pubDate")
+                if title_el is not None and title_el.text:
+                    headlines.append({
+                        "title": title_el.text.strip(),
+                        "link": link_el.text.strip() if link_el is not None and link_el.text else "",
+                        "pub": pub_el.text.strip() if pub_el is not None and pub_el.text else "",
+                    })
+            if len(headlines) >= max_items:
+                break
+        except Exception:
+            continue
+    return headlines[:max_items]
+
+
+gp_col1, gp_col2, gp_col3 = st.columns([2.4, 1, 1])
+with gp_col1:
+    st.markdown("## 🌍 Global Market Pulse — overnight cues for tomorrow's open")
+with gp_col2:
+    global_refresh_minutes = st.selectbox(
+        "Auto-refresh", [5, 10], index=0,
+        format_func=lambda m: f"every {m} min", key="global_refresh_interval",
+        label_visibility="collapsed"
+    )
+with gp_col3:
+    if st.button("🔄 Refresh Now", key="refresh_global_btn"):
+        fetch_global_snapshot.clear()
+        fetch_global_headlines.clear()
+
+# Dedicated auto-refresh timer for this section, independent of the Live
+# Market Snapshot's own refresh cadence - keeps global cues feeling "live"
+# without forcing the whole page's other data (daily analysis, backtest) to
+# re-run on a shorter cycle than needed.
+if AUTOREFRESH_AVAILABLE:
+    st_autorefresh(interval=global_refresh_minutes * 60 * 1000, key="global_pulse_autorefresh")
+else:
+    st.markdown(
+        f'<meta http-equiv="refresh" content="{global_refresh_minutes * 60}">',
+        unsafe_allow_html=True
+    )
+
+global_data = fetch_global_snapshot()
+
+# --- Compute an overall global sentiment score (how many markets are up vs down) ---
+all_pct_changes = []
+for group, items in global_data.items():
+    if group == "🛢️ Commodities & FX":
+        continue  # commodities/FX shown separately, not counted in equity sentiment
+    for label, vals in items.items():
+        if vals is not None:
+            all_pct_changes.append(vals["pct"])
+
+if all_pct_changes:
+    up_count = sum(1 for v in all_pct_changes if v > 0)
+    down_count = sum(1 for v in all_pct_changes if v < 0)
+    total = len(all_pct_changes)
+    avg_change = sum(all_pct_changes) / total
+    if up_count > down_count and avg_change > 0.15:
+        sentiment, sentiment_color, sentiment_icon = "BULLISH", "#0b8043", "🟢"
+        sentiment_msg = "Global markets broadly UP — this typically supports a GAP-UP open for Nifty/Sensex."
+    elif down_count > up_count and avg_change < -0.15:
+        sentiment, sentiment_color, sentiment_icon = "BEARISH", "#c5221f", "🔴"
+        sentiment_msg = "Global markets broadly DOWN — this typically pressures a GAP-DOWN open for Nifty/Sensex."
+    else:
+        sentiment, sentiment_color, sentiment_icon = "MIXED", "#e37400", "🟡"
+        sentiment_msg = "Global markets are MIXED — no strong overnight directional cue either way."
+else:
+    sentiment, sentiment_color, sentiment_icon, sentiment_msg, avg_change, up_count, down_count, total = (
+        "UNAVAILABLE", "#888888", "⚪", "Global data temporarily unavailable.", 0, 0, 0, 0
+    )
+
+st.markdown(
+    f"""
+    <div style='background:linear-gradient(90deg, {sentiment_color}22, {sentiment_color}05);
+                border:2px solid {sentiment_color};border-radius:14px;padding:16px 20px;margin-bottom:12px'>
+        <h2 style='margin:0;color:{sentiment_color}'>{sentiment_icon} Global Sentiment: {sentiment}</h2>
+        <p style='margin:6px 0 0 0;color:#333;font-size:14.5px'>{sentiment_msg}</p>
+        <p style='margin:4px 0 0 0;color:#666;font-size:12.5px'>
+            {up_count} up / {down_count} down out of {total} major global indices tracked &nbsp;|&nbsp;
+            Average move: <b>{avg_change:+.2f}%</b>
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+# --- Color-coded cards, grouped by region ---
+group_cols = st.columns(len(GLOBAL_TICKERS))
+for gcol, (group_name, items) in zip(group_cols, global_data.items()):
+    with gcol:
+        st.markdown(f"**{group_name}**")
+        for label, vals in items.items():
+            if vals is None:
+                st.markdown(
+                    f"<div style='padding:6px 8px;color:#999;font-size:12.5px'>{label}: data unavailable</div>",
+                    unsafe_allow_html=True
+                )
+                continue
+            pct = vals["pct"]
+            is_fx_or_commodity = group_name == "🛢️ Commodities & FX"
+            # For USD/INR, a RISING rupee value (i.e. Rupee weakening) is a mild negative
+            # cue for Indian equities (imported inflation, FII outflows) - flag with a note.
+            up_is_good = not (label == "USD/INR")
+            positive = pct > 0
+            good = positive if up_is_good else (not positive)
+            bg = "#e6f4ea" if good else ("#fdecea" if pct != 0 else "#f5f5f5")
+            fg = "#0b8043" if good else ("#c5221f" if pct != 0 else "#888888")
+            arrow = "▲" if positive else ("▼" if pct < 0 else "—")
+            st.markdown(
+                f"""
+                <div style='background-color:{bg};border-radius:8px;padding:8px 10px;margin-bottom:6px'>
+                    <div style='display:flex;justify-content:space-between;align-items:center'>
+                        <span style='font-size:12.5px;color:#333'>{label}</span>
+                        <span style='font-size:12.5px;font-weight:bold;color:{fg}'>{arrow} {pct:+.2f}%</span>
+                    </div>
+                    <div style='font-size:11px;color:#777'>{vals['price']:,.2f}</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+now_ist = datetime.datetime.utcnow() + datetime.timedelta(hours=5, minutes=30)
+st.caption(
+    f"🔁 Auto-refreshing every {global_refresh_minutes} min — last checked {now_ist.strftime('%d-%b-%Y %H:%M:%S')} IST. "
+    "ℹ️ US & Europe show their LAST CLOSED session (overnight for India). Asia shows the LATEST available "
+    "session (may be live-trading during Indian morning hours). USD/INR rising = rupee weakening, which is "
+    "a mild negative cue for Indian equities. Data via Yahoo Finance, ~15-20 min delayed."
+)
+
+# --- Curated headlines panel ---
+with st.expander("📰 Key Global Headlines (tap to expand)", expanded=False):
+    headlines = fetch_global_headlines()
+    if not headlines:
+        st.info("Headlines feed temporarily unavailable. Check back after refreshing.")
+    else:
+        for h in headlines:
+            if h["link"]:
+                st.markdown(f"🔹 [{h['title']}]({h['link']})  \n<span style='color:#999;font-size:11px'>{h['pub']}</span>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"🔹 {h['title']}")
+    st.caption("Headlines are pulled from public market-news RSS feeds and are NOT curated or verified by this app for accuracy.")
+
+st.markdown("---")
+
 
 # ============ AUTO-REFRESH SETUP (for Live Market Snapshot) ============
 AUTOREFRESH_AVAILABLE = False
