@@ -200,10 +200,15 @@ def load_and_process(ticker, period):
     return scored
 
 
-# ============ INTRADAY DATA (chart display ONLY, for 1D/5D/1W) ============
+# ============ INTRADAY DATA (chart display, for 1D/5D/1W) ============
+# NOW also runs the FULL indicator/signal pipeline on the intraday candles
+# themselves - this is what makes SMA/Supertrend/STRONG BUY-SELL markers show
+# up on the 1D/5D/1W charts, not just the daily swing charts (1M and beyond).
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_intraday(ticker, yf_period, yf_interval):
-    """Real minute-level candles for short-range chart zoom. Cache 5 min (intraday moves fast)."""
+    """Real minute-level candles for short-range chart zoom, WITH the same indicator/signal
+    engine applied as the daily data - so SMA/Supertrend/STRONG BUY-SELL markers also work
+    on 1D/5D/1W intraday charts, not just the daily swing charts."""
     try:
         data = yf.download(ticker, period=yf_period, interval=yf_interval, progress=False)
         if data is None or data.empty:
@@ -211,7 +216,30 @@ def fetch_intraday(ticker, yf_period, yf_interval):
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         data = data.dropna(subset=["Close"])
-        return data
+        if data.empty or len(data) < 20:
+            return data if not data.empty else None
+
+        try:
+            enriched = indicators.add_all_indicators(data)
+            enriched = indicators.add_supertrend_adx(enriched)
+            scored = signal_engine.annotate_signals(enriched)
+            scored["ST_SIGNAL"] = scored.apply(signal_engine.supertrend_adx_signal, axis=1)
+
+            def combined(r):
+                if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY":
+                    return "STRONG BUY"
+                if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL":
+                    return "STRONG SELL"
+                if r["SIGNAL"] == "HOLD" and r["ST_SIGNAL"] == "HOLD":
+                    return "HOLD"
+                return "MIXED / CAUTION"
+
+            scored["FINAL_SIGNAL"] = scored.apply(combined, axis=1)
+            return scored
+        except Exception:
+            # If indicator calc fails (e.g. too few rows for some rolling window),
+            # fall back to plain candles so the chart still renders.
+            return data
     except Exception:
         return None
 
@@ -448,32 +476,34 @@ fig.add_hline(
     annotation=dict(font=dict(color="white", size=11), bgcolor=last_price_color, bordercolor=last_price_color)
 )
 
-if not is_intraday:
-    if show_sma and "SMA_FAST" in chart_df.columns:
-        fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SMA_FAST"], name="SMA Fast", line=dict(width=1, color="teal")))
-    if show_sma and "SMA_SLOW" in chart_df.columns:
-        fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SMA_SLOW"], name="SMA Slow", line=dict(width=1, color="purple")))
-    if show_supertrend and "SUPERTREND" in chart_df.columns:
-        fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SUPERTREND"], name="Supertrend", line=dict(width=1.5, color="magenta", dash="dot")))
+# NOTE: these overlays now run on BOTH daily and intraday chart_df, since
+# fetch_intraday() computes the same SMA/Supertrend/signal columns as the
+# daily pipeline. This is what makes BUY/SELL markers show up on 1D/5D/1W too.
+if show_sma and "SMA_FAST" in chart_df.columns:
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SMA_FAST"], name="SMA Fast", line=dict(width=1, color="teal")))
+if show_sma and "SMA_SLOW" in chart_df.columns:
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SMA_SLOW"], name="SMA Slow", line=dict(width=1, color="purple")))
+if show_supertrend and "SUPERTREND" in chart_df.columns:
+    fig.add_trace(go.Scatter(x=chart_df.index, y=chart_df["SUPERTREND"], name="Supertrend", line=dict(width=1.5, color="magenta", dash="dot")))
 
-    if show_rule_signals and "SIGNAL" in chart_df.columns:
-        buys, sells = chart_df[chart_df["SIGNAL"] == "BUY"], chart_df[chart_df["SIGNAL"] == "SELL"]
-        fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="BUY (rule)", marker=dict(color="lightgreen", size=7, symbol="triangle-up")))
-        fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="SELL (rule)", marker=dict(color="lightcoral", size=7, symbol="triangle-down")))
+if show_rule_signals and "SIGNAL" in chart_df.columns:
+    buys, sells = chart_df[chart_df["SIGNAL"] == "BUY"], chart_df[chart_df["SIGNAL"] == "SELL"]
+    fig.add_trace(go.Scatter(x=buys.index, y=buys["Close"], mode="markers", name="BUY (rule)", marker=dict(color="lightgreen", size=7, symbol="triangle-up")))
+    fig.add_trace(go.Scatter(x=sells.index, y=sells["Close"], mode="markers", name="SELL (rule)", marker=dict(color="lightcoral", size=7, symbol="triangle-down")))
 
-    if show_final_signals and "FINAL_SIGNAL" in chart_df.columns:
-        buy_points = chart_df[chart_df["FINAL_SIGNAL"] == "STRONG BUY"]
-        sell_points = chart_df[chart_df["FINAL_SIGNAL"] == "STRONG SELL"]
-        fig.add_trace(go.Scatter(
-            x=buy_points.index, y=buy_points["Low"] * 0.985, mode="markers+text", name="STRONG BUY",
-            marker=dict(symbol="triangle-up", size=18, color="#00c853", line=dict(width=1.5, color="darkgreen")),
-            text=["BUY"] * len(buy_points), textposition="bottom center", textfont=dict(color="darkgreen", size=10)
-        ))
-        fig.add_trace(go.Scatter(
-            x=sell_points.index, y=sell_points["High"] * 1.015, mode="markers+text", name="STRONG SELL",
-            marker=dict(symbol="triangle-down", size=18, color="#d50000", line=dict(width=1.5, color="darkred")),
-            text=["SELL"] * len(sell_points), textposition="top center", textfont=dict(color="darkred", size=10)
-        ))
+if show_final_signals and "FINAL_SIGNAL" in chart_df.columns:
+    buy_points = chart_df[chart_df["FINAL_SIGNAL"] == "STRONG BUY"]
+    sell_points = chart_df[chart_df["FINAL_SIGNAL"] == "STRONG SELL"]
+    fig.add_trace(go.Scatter(
+        x=buy_points.index, y=buy_points["Low"] * 0.985, mode="markers+text", name="STRONG BUY",
+        marker=dict(symbol="triangle-up", size=18, color="#00c853", line=dict(width=1.5, color="darkgreen")),
+        text=["BUY"] * len(buy_points), textposition="bottom center", textfont=dict(color="darkgreen", size=10)
+    ))
+    fig.add_trace(go.Scatter(
+        x=sell_points.index, y=sell_points["High"] * 1.015, mode="markers+text", name="STRONG SELL",
+        marker=dict(symbol="triangle-down", size=18, color="#d50000", line=dict(width=1.5, color="darkred")),
+        text=["SELL"] * len(sell_points), textposition="top center", textfont=dict(color="darkred", size=10)
+    ))
 
 if trade_plan is not None:
     fig.add_hline(y=trade_plan["stop_loss"], line_dash="dash", line_color="red", annotation_text="Stop-Loss", annotation_position="top left")
@@ -519,9 +549,12 @@ st.plotly_chart(fig, use_container_width=True, config={
 })
 
 st.caption(
-    "💡 1D/5D/1W now use real minute-level intraday data. 1M and beyond use your daily swing data with "
-    "SMA/Supertrend/signals overlaid. The price axis is locked to only the visible candles so it always "
-    "fills the chart properly. The dotted line = last traded price. Dashed red/green lines = current Stop-Loss/Target from the Trade Plan above."
+    "💡 1D/5D/1W now use real minute-level intraday data, WITH SMA/Supertrend/STRONG BUY-SELL markers "
+    "computed directly on those intraday candles (green ▲ / red ▼ = where the rule engine and Supertrend "
+    "agree on that timeframe). 1M and beyond use your daily swing data with the same overlays. The price "
+    "axis is locked to only the visible candles so it always fills the chart properly. The dotted line = "
+    "last traded price. Dashed red/green lines = current Stop-Loss/Target from the Trade Plan above (which "
+    "is always based on the DAILY signal, not the intraday one - so it may not always line up with intraday markers)."
 )
 
 if fullscreen_mode:
