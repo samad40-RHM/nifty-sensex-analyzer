@@ -84,38 +84,89 @@ def fetch_global_snapshot():
     return results
 
 
+def _parse_rss(url, timeout=6):
+    """Fetches and parses a single RSS feed into a list of {title, link, pub} dicts.
+    Uses only Python's built-in urllib/ElementTree - no extra dependency needed."""
+    items = []
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read()
+        root = ET.fromstring(raw)
+        for item in root.findall(".//item"):
+            title_el = item.find("title")
+            link_el = item.find("link")
+            pub_el = item.find("pubDate")
+            if title_el is not None and title_el.text:
+                items.append({
+                    "title": title_el.text.strip(),
+                    "link": link_el.text.strip() if link_el is not None and link_el.text else "",
+                    "pub": pub_el.text.strip() if pub_el is not None and pub_el.text else "",
+                })
+    except Exception:
+        pass
+    return items
+
+
+# Broad set of free, no-auth RSS feeds covering Indian + global markets/business news.
+GLOBAL_NEWS_FEEDS = [
+    ("Economic Times - Markets", "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms"),
+    ("Moneycontrol - Latest News", "https://www.moneycontrol.com/rss/latestnews.xml"),
+    ("Moneycontrol - Market Reports", "https://www.moneycontrol.com/rss/marketreports.xml"),
+    ("Moneycontrol - Business", "https://www.moneycontrol.com/rss/business.xml"),
+    ("Moneycontrol - Economy", "https://www.moneycontrol.com/rss/economy.xml"),
+    ("CNBC - World Markets", "https://www.cnbc.com/id/100003114/device/rss/rss.html"),
+    ("CNBC - Economy", "https://www.cnbc.com/id/20910258/device/rss/rss.html"),
+    ("Business Standard - Markets", "https://www.business-standard.com/rss/markets-106.rss"),
+    ("Livemint - Markets", "https://www.livemint.com/rss/markets"),
+]
+
+MONEYCONTROL_FEEDS = [
+    ("Latest News", "https://www.moneycontrol.com/rss/latestnews.xml"),
+    ("Market Reports", "https://www.moneycontrol.com/rss/marketreports.xml"),
+    ("Business", "https://www.moneycontrol.com/rss/business.xml"),
+    ("Economy", "https://www.moneycontrol.com/rss/economy.xml"),
+    ("Results", "https://www.moneycontrol.com/rss/results.xml"),
+]
+
+
 @st.cache_data(ttl=480, show_spinner=False)
-def fetch_global_headlines(max_items=6):
-    """Pulls top market-moving headlines from public, no-auth-required RSS
-    feeds (Economic Times Markets + Reuters-style world/business feeds).
-    Uses only Python's built-in urllib/ElementTree - no extra dependency
-    needs to be added to requirements.txt."""
-    feeds = [
-        "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
-        "https://www.moneycontrol.com/rss/marketreports.xml",
-        "https://www.moneycontrol.com/rss/business.xml",
-    ]
+def fetch_global_headlines(max_items=10):
+    """Pulls top market-moving headlines from a broad set of public,
+    no-auth-required RSS feeds spanning Indian (Economic Times, Moneycontrol,
+    Business Standard, Livemint) and global (CNBC) markets/business news."""
     headlines = []
-    for url in feeds:
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                raw = resp.read()
-            root = ET.fromstring(raw)
-            for item in root.findall(".//item")[:max_items]:
-                title_el = item.find("title")
-                link_el = item.find("link")
-                pub_el = item.find("pubDate")
-                if title_el is not None and title_el.text:
-                    headlines.append({
-                        "title": title_el.text.strip(),
-                        "link": link_el.text.strip() if link_el is not None and link_el.text else "",
-                        "pub": pub_el.text.strip() if pub_el is not None and pub_el.text else "",
-                    })
-            if len(headlines) >= max_items:
-                break
-        except Exception:
-            continue
+    seen_titles = set()
+    for source_name, url in GLOBAL_NEWS_FEEDS:
+        items = _parse_rss(url)
+        for it in items[:4]:
+            if it["title"] in seen_titles:
+                continue
+            seen_titles.add(it["title"])
+            it = dict(it)
+            it["source"] = source_name
+            headlines.append(it)
+        if len(headlines) >= max_items * 2:
+            break
+    return headlines[:max_items]
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_moneycontrol_headlines(max_items=12):
+    """Pulls the LATEST news specifically from Moneycontrol's own RSS feeds
+    (Latest News, Market Reports, Business, Economy, Results combined),
+    refreshed on a fast 5-minute cycle."""
+    headlines = []
+    seen_titles = set()
+    for section_name, url in MONEYCONTROL_FEEDS:
+        items = _parse_rss(url)
+        for it in items[:6]:
+            if it["title"] in seen_titles:
+                continue
+            seen_titles.add(it["title"])
+            it = dict(it)
+            it["section"] = section_name
+            headlines.append(it)
     return headlines[:max_items]
 
 
@@ -233,18 +284,42 @@ st.caption(
     "a mild negative cue for Indian equities. Data via Yahoo Finance, ~15-20 min delayed."
 )
 
-# --- Curated headlines panel ---
-with st.expander("📰 Key Global Headlines (tap to expand)", expanded=False):
+# --- Curated headlines panel (broad mix: ET, Moneycontrol, CNBC, Business Standard, Livemint) ---
+with st.expander("📰 Key Global & Market Headlines (tap to expand)", expanded=False):
     headlines = fetch_global_headlines()
     if not headlines:
         st.info("Headlines feed temporarily unavailable. Check back after refreshing.")
     else:
         for h in headlines:
+            src_tag = f"<span style='background:#eef2f7;color:#555;font-size:10.5px;padding:1px 6px;border-radius:6px;margin-right:6px'>{h.get('source','')}</span>"
             if h["link"]:
-                st.markdown(f"🔹 [{h['title']}]({h['link']})  \n<span style='color:#999;font-size:11px'>{h['pub']}</span>", unsafe_allow_html=True)
+                st.markdown(
+                    f"{src_tag}🔹 [{h['title']}]({h['link']})  \n<span style='color:#999;font-size:11px'>{h['pub']}</span>",
+                    unsafe_allow_html=True
+                )
             else:
-                st.markdown(f"🔹 {h['title']}")
-    st.caption("Headlines are pulled from public market-news RSS feeds and are NOT curated or verified by this app for accuracy.")
+                st.markdown(f"{src_tag}🔹 {h['title']}", unsafe_allow_html=True)
+    st.caption(
+        "Combined feed from Economic Times, Moneycontrol, CNBC, Business Standard & Livemint. "
+        "Headlines are pulled live from public RSS feeds and are NOT curated or verified by this app for accuracy."
+    )
+
+# --- Dedicated Moneycontrol-only panel, fast 5-min refresh ---
+with st.expander("📌 Latest from Moneycontrol (tap to expand)", expanded=False):
+    mc_headlines = fetch_moneycontrol_headlines()
+    if not mc_headlines:
+        st.info("Moneycontrol feed temporarily unavailable. Check back after refreshing.")
+    else:
+        for h in mc_headlines:
+            section_tag = f"<span style='background:#fff3e0;color:#e37400;font-size:10.5px;padding:1px 6px;border-radius:6px;margin-right:6px;font-weight:bold'>{h.get('section','')}</span>"
+            if h["link"]:
+                st.markdown(
+                    f"{section_tag}📍 [{h['title']}]({h['link']})  \n<span style='color:#999;font-size:11px'>{h['pub']}</span>",
+                    unsafe_allow_html=True
+                )
+            else:
+                st.markdown(f"{section_tag}📍 {h['title']}", unsafe_allow_html=True)
+    st.caption("Sourced directly from Moneycontrol's own RSS feeds (Latest News, Market Reports, Business, Economy, Results). Refreshes every ~5 minutes.")
 
 st.markdown("---")
 
