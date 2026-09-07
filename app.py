@@ -10,7 +10,6 @@ import backtester
 
 st.set_page_config(page_title="Nifty & Sensex Daily Analyzer", layout="wide")
 
-# Tighten Streamlit's default padding so the chart gets more real screen space
 st.markdown("""
     <style>
         .block-container {padding-top: 1rem; padding-bottom: 1rem; padding-left: 1.5rem; padding-right: 1.5rem;}
@@ -34,7 +33,7 @@ with st.sidebar:
         "Candle Resolution",
         ["Daily", "Weekly", "Monthly"],
         index=0,
-        help="Daily = 1 candle/day, Weekly = 1 candle/week, Monthly = 1 candle/month."
+        help="Daily = 1 candle/day, Weekly = 1 candle/week, Monthly = 1 candle/month. Quick-zoom buttons below the chart work best with Daily."
     )
     show_sma = st.checkbox("Show SMA lines", value=True)
     show_supertrend = st.checkbox("Show Supertrend line", value=True)
@@ -105,7 +104,6 @@ if full_df is None:
     st.info("Click 'Fetch data & analyze' to begin.")
     st.stop()
 
-# Apply Daily / Weekly / Monthly resolution (full history - range buttons on chart handle zoom)
 df = resample_ohlc(full_df, timeframe)
 
 if df.empty or len(df) < 2:
@@ -115,7 +113,7 @@ if df.empty or len(df) < 2:
 latest = df.iloc[-1]
 explain = signal_engine.explain_latest(latest)
 
-# ============ MAIN CHART (always shown, even in full-screen mode) ============
+# ============ MAIN CHART ============
 final_signal = latest["FINAL_SIGNAL"]
 final_color = {"STRONG BUY": "darkgreen", "STRONG SELL": "darkred", "HOLD": "gray", "MIXED / CAUTION": "orange"}[final_signal]
 
@@ -163,23 +161,56 @@ if show_final_signals:
         text=["SELL"] * len(sell_points), textposition="top center", textfont=dict(color="darkred", size=10)
     ))
 
-# TradingView-style quick range buttons directly on the chart
-fig.update_xaxes(
-    rangeselector=dict(
+# ---- Build quick-zoom buttons based on ACTUAL trading-day rows in df ----
+# (This avoids the bug where calendar-day-based buttons land on weekends/holidays
+#  with zero candles and appear blank.)
+n = len(df)
+full_start, full_end = df.index[0], df.index[-1]
+
+def window_start(num_rows):
+    idx = max(0, n - num_rows)
+    return df.index[idx]
+
+# Approx trading-day counts for each label (India ~21 trading days/month)
+button_specs = [
+    ("1D", 5),     # daily-only data can't show true intraday; shows last few sessions for context
+    ("5D", 5),
+    ("1W", 5),
+    ("1M", 22),
+    ("3M", 66),
+    ("6M", 132),
+    ("9M", 198),
+    ("1Y", 264),
+]
+
+buttons = []
+for label, rows in button_specs:
+    buttons.append(dict(
+        label=label,
+        method="relayout",
+        args=[{"xaxis.range": [window_start(rows), full_end]}]
+    ))
+buttons.append(dict(
+    label="All",
+    method="relayout",
+    args=[{"xaxis.range": [full_start, full_end]}]
+))
+
+fig.update_layout(
+    updatemenus=[dict(
+        type="buttons",
+        direction="right",
+        x=0, xanchor="left",
+        y=1.12, yanchor="top",
+        showactive=True,
         bgcolor="#f0f2f6",
-        activecolor="#4c8bf5",
-        buttons=list([
-            dict(count=1, label="1d", step="day", stepmode="backward"),
-            dict(count=5, label="5d", step="day", stepmode="backward"),
-            dict(count=7, label="1w", step="day", stepmode="backward"),
-            dict(count=1, label="1m", step="month", stepmode="backward"),
-            dict(count=3, label="3m", step="month", stepmode="backward"),
-            dict(count=6, label="6m", step="month", stepmode="backward"),
-            dict(count=9, label="9m", step="month", stepmode="backward"),
-            dict(count=1, label="1y", step="year", stepmode="backward"),
-            dict(step="all", label="All"),
-        ])
-    ),
+        buttons=buttons
+    )]
+)
+
+# Remove weekend/holiday gaps so candles sit close together (no stretched blank space)
+fig.update_xaxes(
+    rangebreaks=[dict(bounds=["sat", "mon"])],
     rangeslider=dict(visible=False),
     type="date"
 )
@@ -189,7 +220,7 @@ chart_height = 900 if fullscreen_mode else 700
 fig.update_layout(
     title=f"{index_name} — {timeframe} Chart",
     height=chart_height,
-    margin=dict(l=10, r=10, t=60, b=10),
+    margin=dict(l=10, r=10, t=90, b=10),
     yaxis=dict(title="Price"),
     yaxis2=dict(title="Volume", overlaying="y", side="right", showgrid=False),
     template="plotly_white",
@@ -204,7 +235,13 @@ st.plotly_chart(fig, use_container_width=True, config={
     "displaylogo": False,
 })
 
-st.caption("💡 Tip: Use the 1d / 5d / 1w / 1m / 3m / 6m / 9m / 1y / All buttons above the chart to zoom the time range instantly — just like NSE/Moneycontrol. Click the camera icon in the chart toolbar to save it as an image, or drag directly on the chart to zoom into any custom range.")
+st.caption(
+    "💡 Buttons above the chart (1D/5D/1W/1M/3M/6M/9M/1Y/All) jump to that many "
+    "*actual trading sessions* of history so you always see real candles — no blank windows. "
+    "Note: 1D/5D/1W look similar because the underlying data is daily candles, not live intraday ticks; "
+    "for true intraday 1-minute charts a paid real-time data feed would be needed. "
+    "Drag directly on the chart or scroll to zoom to any custom range, double-click to reset."
+)
 
 if fullscreen_mode:
     st.info("Full-Screen Chart Mode is ON — other sections (metrics, logs, backtest) are hidden. Turn it off in the sidebar to see everything again.")
