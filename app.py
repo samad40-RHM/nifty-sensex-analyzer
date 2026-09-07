@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import yfinance as yf
+import datetime
 import logger
 import config as cfg
 import data_fetcher
@@ -18,6 +19,93 @@ st.markdown("""
         [data-testid="stMetricValue"] {font-size: 1.1rem;}
     </style>
 """, unsafe_allow_html=True)
+
+# ============ LIVE KPI STRIP (Nifty & Sensex, near-real-time) ============
+# Placed at the very top of the page, above the title, so it's the first thing
+# visible on load - like the index ticker strip on Moneycontrol/NSE homepages.
+# It loops over ALL configured indices independently of the sidebar selection,
+# and does not require clicking "Fetch data & analyze" to appear.
+
+@st.cache_data(ttl=30, show_spinner=False)
+def fetch_live_quote(yf_ticker):
+    """Pulls the latest available 1-minute candle for a quick live-style KPI card.
+    Cached only 30s so repeated reruns/refreshes pick up new data quickly."""
+    try:
+        data = yf.download(yf_ticker, period="1d", interval="1m", progress=False)
+        if data is None or data.empty:
+            data = yf.download(yf_ticker, period="5d", interval="5m", progress=False)
+        if data is None or data.empty:
+            return None
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        data = data.dropna(subset=["Close"])
+        if data.empty:
+            return None
+
+        last_price = float(data["Close"].iloc[-1])
+        day_high = float(data["High"].max())
+        day_low = float(data["Low"].min())
+        day_open = float(data["Open"].iloc[0])
+        change = last_price - day_open
+        pct_change = (change / day_open) * 100 if day_open else 0
+        last_time = data.index[-1]
+        return {
+            "price": last_price, "change": change, "pct_change": pct_change,
+            "high": day_high, "low": day_low, "time": last_time
+        }
+    except Exception:
+        return None
+
+
+st.markdown("## 📡 Live Market Snapshot")
+lk1, lk2, lk3 = st.columns([1, 1, 0.6])
+with lk3:
+    if st.button("🔄 Refresh Live Prices"):
+        fetch_live_quote.clear()
+
+live_cols = st.columns(len(cfg.INDICES))
+latest_update_time = None
+
+for col, (idx_name, idx_ticker) in zip(live_cols, cfg.INDICES.items()):
+    quote = fetch_live_quote(idx_ticker)
+    with col:
+        if quote is None:
+            st.warning(f"{idx_name}: live quote unavailable right now.")
+            continue
+        arrow = "🟢▲" if quote["change"] >= 0 else "🔴▼"
+        card_color = "#e6f4ea" if quote["change"] >= 0 else "#fdecea"
+        text_color = "#0b8043" if quote["change"] >= 0 else "#c5221f"
+        st.markdown(
+            f"""
+            <div style='background-color:{card_color};border-radius:10px;padding:16px;text-align:center;border:1px solid #ddd'>
+                <h3 style='margin:0;color:#333'>{idx_name}</h3>
+                <h1 style='margin:4px 0;color:{text_color};font-size:2.2rem'>{quote['price']:,.2f}</h1>
+                <p style='margin:0;color:{text_color};font-weight:bold;font-size:1.05rem'>
+                    {arrow} {quote['change']:+,.2f} ({quote['pct_change']:+.2f}%)
+                </p>
+                <p style='margin:6px 0 0 0;color:#666;font-size:12px'>
+                    Day H: {quote['high']:,.2f} &nbsp;|&nbsp; Day L: {quote['low']:,.2f}
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+        if latest_update_time is None or quote["time"] > latest_update_time:
+            latest_update_time = quote["time"]
+
+if latest_update_time is not None:
+    try:
+        display_time = latest_update_time.tz_convert("Asia/Kolkata").strftime("%d-%b-%Y %H:%M:%S IST")
+    except Exception:
+        display_time = str(latest_update_time)
+    st.caption(
+        f"⏱️ Last updated: {display_time}. Refreshes automatically every ~30s on page interaction, "
+        f"or click '🔄 Refresh Live Prices' to force an update. Note: Yahoo Finance index data is typically "
+        f"delayed a few minutes and updates only during NSE/BSE market hours (9:15 AM–3:30 PM IST, Mon–Fri) — "
+        f"this is NOT a paid real-time feed."
+    )
+
+st.markdown("---")
 
 st.title("Nifty & Sensex Daily Analyzer")
 st.caption("Educational tool only - not financial advice. Manage your own risk.")
@@ -331,17 +419,6 @@ else:
     fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])], rangeslider=dict(visible=False), type="date")
 
 # --- Force the price axis to zoom to the VISIBLE candles only ---
-# (Fixes a classic Plotly issue where zooming/slicing does not automatically
-#  rescale the y-axis, leaving old/wider historical price levels baked into
-#  the scale and squashing recent candles near the top of the chart.)
-price_high_series = pd.concat([
-    chart_df["High"],
-    pd.Series([trade_plan["stop_loss"], trade_plan["target"]]) if trade_plan is not None else pd.Series(dtype=float)
-])
-price_low_series = pd.concat([
-    chart_df["Low"],
-    pd.Series([trade_plan["stop_loss"], trade_plan["target"]]) if trade_plan is not None else pd.Series(dtype=float)
-])
 visible_high = chart_df["High"].max()
 visible_low = chart_df["Low"].min()
 price_padding = (visible_high - visible_low) * 0.08 if visible_high > visible_low else visible_high * 0.01
@@ -363,11 +440,9 @@ st.plotly_chart(fig, use_container_width=True, config={
 })
 
 st.caption(
-    "💡 1D/5D/1W now use real minute-level intraday data (auto-refreshes every 5 min while market is open). "
-    "1M and beyond use your daily swing data with SMA/Supertrend/signals overlaid. "
-    "The price axis is now locked to only the visible candles, so it will always fill the chart properly "
-    "instead of looking squashed. Dashed red/green lines = current Stop-Loss/Target from the Trade Plan above. "
-    "Intraday data depends on Yahoo Finance availability and may be limited outside market hours or for very old dates."
+    "💡 1D/5D/1W now use real minute-level intraday data. 1M and beyond use your daily swing data with "
+    "SMA/Supertrend/signals overlaid. The price axis is locked to only the visible candles so it always "
+    "fills the chart properly. Dashed red/green lines = current Stop-Loss/Target from the Trade Plan above."
 )
 
 if fullscreen_mode:
