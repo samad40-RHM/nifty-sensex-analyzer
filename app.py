@@ -360,6 +360,37 @@ st.info("📱 Tip: On mobile, tap the **>›** arrow at the top-left to open Set
 
 @st.cache_data(ttl=30, show_spinner=False)
 def fetch_live_quote(yf_ticker):
+    """
+    Tries the freshest available source first (Yahoo's fast_info, which
+    carries a near-real-time last-traded-price field), then falls back to
+    1-minute candle history, then 5-minute candle history. fast_info is
+    typically fresher than waiting for a full 1-minute candle to close,
+    though it is still NOT a paid real-time exchange feed - Yahoo Finance
+    free data always carries some inherent delay versus the live NSE/BSE tape.
+    """
+    day_high = day_low = day_open = None
+    last_time = None
+
+    # --- Attempt 1: fast_info (near-real-time last price + day range) ---
+    try:
+        tk = yf.Ticker(yf_ticker)
+        fi = tk.fast_info
+        last_price = float(fi.get("last_price") or fi.get("lastPrice"))
+        day_high = float(fi.get("day_high") or fi.get("dayHigh") or last_price)
+        day_low = float(fi.get("day_low") or fi.get("dayLow") or last_price)
+        day_open = float(fi.get("open") or last_price)
+        if last_price and last_price > 0:
+            change = last_price - day_open
+            pct_change = (change / day_open) * 100 if day_open else 0
+            last_time = pd.Timestamp.utcnow()
+            return {
+                "price": last_price, "change": change, "pct_change": pct_change,
+                "high": day_high, "low": day_low, "time": last_time
+            }
+    except Exception:
+        pass
+
+    # --- Attempt 2 & 3: fall back to candle history (previous behavior) ---
     try:
         data = yf.download(yf_ticker, period="1d", interval="1m", progress=False)
         if data is None or data.empty:
@@ -390,22 +421,23 @@ refresh_col1, refresh_col2 = st.columns([3, 1])
 with refresh_col1:
     st.markdown("## 📡 Live Market Snapshot")
 with refresh_col2:
-    refresh_seconds = st.selectbox(
-        "Auto-refresh every", [60, 90, 120], index=1,
-        format_func=lambda s: f"{s}s", key="refresh_interval",
-        label_visibility="collapsed"
+    st.markdown(
+        "<p style='text-align:right;color:#666;font-size:12.5px;margin-top:8px'>Fixed refresh: every 2 min</p>",
+        unsafe_allow_html=True
     )
+
+refresh_seconds = 120  # fixed at 2 minutes, per request — no longer user-selectable
 
 if AUTOREFRESH_AVAILABLE:
     st_autorefresh(interval=refresh_seconds * 1000, key="live_kpi_autorefresh")
-    st.caption(f"🔁 Auto-refreshing every {refresh_seconds}s — no action needed.")
+    st.caption(f"🔁 Auto-refreshing every {refresh_seconds}s (2 min) — no action needed.")
 else:
     st.markdown(
         f'<meta http-equiv="refresh" content="{refresh_seconds}">',
         unsafe_allow_html=True
     )
     st.caption(
-        f"🔁 Auto-refreshing every {refresh_seconds}s (fallback mode — full page reload). "
+        f"🔁 Auto-refreshing every {refresh_seconds}s (2 min, fallback mode — full page reload). "
         f"For a smoother experience without page reloads, add `streamlit-autorefresh` to requirements.txt."
     )
 
@@ -466,10 +498,8 @@ with st.sidebar:
     index_name = st.selectbox("Index", list(cfg.INDICES.keys()))
     period = st.selectbox("History window", ["1y", "2y", "5y", "10y", "max"], index=2)
     allow_short = st.checkbox(
-        "Include SHORT trades (SELL signals)",
-        value=True,
-        help="BUY signals are always simulated. Check this to ALSO simulate shorting on STRONG SELL "
-             "signals in the backtest. Uncheck for a long-only backtest."
+        "Also simulate SHORT trades on SELL signals (uncheck for long-only backtest)",
+        value=True
     )
     run_button = st.button("Fetch data & analyze", type="primary")
 
