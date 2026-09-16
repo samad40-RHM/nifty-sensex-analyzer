@@ -14,12 +14,6 @@ import signal_engine
 import backtester
 import datetime as _dt_module  # aliased only to avoid clashing with the existing `datetime` import above
 
-# ============================================================================
-# 📊 STOCK F&O WATCHLIST — 10 selective, liquid, F&O-eligible large-caps,
-# diversified across sectors (banking, IT, energy, auto, infra, NBFC).
-# Same rule-based Supertrend+ADX+RSI/MACD engine as Nifty/Sensex — NOT a
-# guaranteed-return tip list. See the Stock F&O section near the bottom.
-# ============================================================================
 STOCKS = {
     "Reliance Industries": "RELIANCE.NS",
     "HDFC Bank": "HDFCBANK.NS",
@@ -555,6 +549,28 @@ with st.sidebar:
 
 ticker = cfg.INDICES[index_name]
 
+def _normalize_datetime_index(df):
+    """
+    Forces df's index into a single, consistent, timezone-NAIVE DatetimeIndex,
+    de-duplicated and sorted chronologically.
+
+    Why this exists: mixing timezone-aware timestamps (e.g. today's live
+    price bar, or a tz-aware feed from yfinance/Kite) with timezone-naive
+    historical daily bars produces an index pandas can no longer safely
+    compare/sort/subtract across (`TypeError` inside sort_index, backtest
+    day-count math, etc.). Converting with `utc=True` first safely unifies
+    ANY mix of naive/aware timestamps onto one UTC timeline before the tz
+    is dropped, so every downstream operation gets a clean, ordinary
+    DatetimeIndex to work with - regardless of which raw format the data
+    source (Yahoo Finance today, Kite Connect later) happens to return.
+    """
+    out = df.copy()
+    out.index = pd.to_datetime(out.index, utc=True).tz_localize(None)
+    out = out[~out.index.duplicated(keep="last")]
+    out = out.sort_index()
+    return out
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_and_process(ticker, period):
     raw = data_fetcher.fetch_history(ticker, period, cfg.INTERVAL)
@@ -564,10 +580,22 @@ def load_and_process(ticker, period):
     # move, instead of being frozen on yesterday's completed daily close
     # while the market is still open. Falls back silently to plain daily
     # data if the live quote is unavailable. ---
+    # Ensure raw's own index is a clean, timezone-naive DatetimeIndex BEFORE
+    # we compute/compare "today_ist" against it. yfinance sometimes returns a
+    # tz-aware index (exchange tz) and sometimes tz-naive depending on the
+    # ticker/version - if we don't normalize here first, `last_idx == today_ist`
+    # below can silently compare an aware vs naive Timestamp (raising/behaving
+    # unpredictably), and pd.concat() can produce a MIXED tz index that turns
+    # into an unsortable/unsubtractable object-dtype index downstream (this is
+    # the root cause of the earlier "Backtest" and "sort_index" TypeErrors).
+    raw = _normalize_datetime_index(raw)
+
     try:
         live = fetch_live_quote(ticker)
         if live is not None and len(raw) > 0:
-            today_ist = (pd.Timestamp.utcnow() + pd.Timedelta(hours=5, minutes=30)).normalize()
+            # Build today's timestamp as tz-naive (IST wall-clock date, no tz
+            # attached) so it matches raw's now-normalized naive index exactly.
+            today_ist = (pd.Timestamp.utcnow() + pd.Timedelta(hours=5, minutes=30)).tz_localize(None).normalize()
             last_idx = raw.index[-1].normalize()
             live_open = live["price"] - live["change"]
             new_row = pd.DataFrame(
@@ -586,6 +614,9 @@ def load_and_process(ticker, period):
             else:
                 # Today's candle hasn't formed yet in the daily feed - append it
                 raw = pd.concat([raw, new_row])
+            # Re-normalize after the concat: guarantees a single consistent
+            # tz-naive, deduplicated, sorted DatetimeIndex no matter what.
+            raw = _normalize_datetime_index(raw)
     except Exception:
         pass
 
@@ -623,6 +654,7 @@ def fetch_intraday(ticker, yf_period, yf_interval):
         if isinstance(data.columns, pd.MultiIndex):
             data.columns = data.columns.get_level_values(0)
         data = data.dropna(subset=["Close"])
+        data = _normalize_datetime_index(data)
         if data.empty or len(data) < 20:
             return data if not data.empty else None
 
@@ -933,6 +965,7 @@ def analyze_stock(ticker_, period_="1y"):
     live-candle-patch logic tied to index tickers, and to avoid cache-key
     collisions between index and stock lookups."""
     raw = data_fetcher.fetch_history(ticker_, period_, cfg.INTERVAL)
+    raw = _normalize_datetime_index(raw)
     enriched = indicators.add_all_indicators(raw)
     enriched = indicators.add_supertrend_adx(enriched)
     scored = signal_engine.annotate_signals(enriched)
