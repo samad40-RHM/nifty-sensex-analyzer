@@ -4,6 +4,29 @@ import numpy as np
 import config as cfg
 
 
+def _normalize_datetime_index(df):
+    """
+    Forces df's index into a single, consistent, timezone-NAIVE DatetimeIndex.
+
+    Why this exists: if the incoming data mixes timezone-aware timestamps
+    (e.g. a "live" intraday bar appended with tz info) with timezone-naive
+    historical daily bars, pandas raises `TypeError` the moment anything
+    tries to subtract two timestamps from that index (e.g. computing the
+    backtest's day-count). Using `utc=True` during conversion safely
+    unifies ANY mix of naive/aware timestamps onto one UTC timeline before
+    dropping the tz, so subtraction, sorting, and duplicate-date handling
+    all become safe again - no matter which format the upstream data
+    (Yahoo Finance today, Kite Connect later) happens to hand us.
+    """
+    df = df.copy()
+    df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
+    # Guard against any duplicate timestamps (e.g. a live bar duplicating
+    # the last historical bar's date) which can also break index math.
+    df = df[~df.index.duplicated(keep="last")]
+    df = df.sort_index()
+    return df
+
+
 def _compute_trade_segments(df):
     """
     Breaks the POSITION series into discrete trade segments (a trade = a
@@ -145,7 +168,7 @@ def _prepare_positions(df_with_signals, allow_short=True):
     """Builds POSITION / returns / equity curves from raw signals. Pulled out
     as its own step so both the full backtest and walk-forward slices can
     reuse identical logic without duplicating it."""
-    df = df_with_signals.copy()
+    df = _normalize_datetime_index(df_with_signals)
     position_map = {"BUY": 1, "SELL": -1 if allow_short else 0, "HOLD": 0}
     df["POSITION"] = df["SIGNAL"].map(position_map).shift(1).fillna(0)
     df["STRATEGY_RETURN"] = df["POSITION"] * df["DAILY_RETURN"]
