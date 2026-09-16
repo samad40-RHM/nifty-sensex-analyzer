@@ -7,21 +7,13 @@ import config as cfg
 def _normalize_datetime_index(df):
     """
     Forces df's index into a single, consistent, timezone-NAIVE DatetimeIndex.
-
-    Why this exists: if the incoming data mixes timezone-aware timestamps
-    (e.g. a "live" intraday bar appended with tz info) with timezone-naive
-    historical daily bars, pandas raises `TypeError` the moment anything
-    tries to subtract two timestamps from that index (e.g. computing the
-    backtest's day-count). Using `utc=True` during conversion safely
-    unifies ANY mix of naive/aware timestamps onto one UTC timeline before
-    dropping the tz, so subtraction, sorting, and duplicate-date handling
-    all become safe again - no matter which format the upstream data
-    (Yahoo Finance today, Kite Connect later) happens to hand us.
+    See app.py's identical helper for the full rationale: mixing tz-aware and
+    tz-naive timestamps in the same index breaks subtraction/sorting/comparison
+    throughout pandas. Using utc=True first safely unifies any mix before the
+    tz is dropped.
     """
     df = df.copy()
     df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
-    # Guard against any duplicate timestamps (e.g. a live bar duplicating
-    # the last historical bar's date) which can also break index math.
     df = df[~df.index.duplicated(keep="last")]
     df = df.sort_index()
     return df
