@@ -12,6 +12,26 @@ import data_fetcher
 import indicators
 import signal_engine
 import backtester
+import datetime as _dt_module  # aliased only to avoid clashing with the existing `datetime` import above
+
+# ============================================================================
+# 📊 STOCK F&O WATCHLIST — 10 selective, liquid, F&O-eligible large-caps,
+# diversified across sectors (banking, IT, energy, auto, infra, NBFC).
+# Same rule-based Supertrend+ADX+RSI/MACD engine as Nifty/Sensex — NOT a
+# guaranteed-return tip list. See the Stock F&O section near the bottom.
+# ============================================================================
+STOCKS = {
+    "Reliance Industries": "RELIANCE.NS",
+    "HDFC Bank": "HDFCBANK.NS",
+    "ICICI Bank": "ICICIBANK.NS",
+    "State Bank of India": "SBIN.NS",
+    "Axis Bank": "AXISBANK.NS",
+    "TCS": "TCS.NS",
+    "Infosys": "INFY.NS",
+    "Tata Motors": "TATAMOTORS.NS",
+    "Larsen & Toubro": "LT.NS",
+    "Bajaj Finance": "BAJFINANCE.NS",
+}
 
 st.set_page_config(page_title="Nifty & Sensex Daily Analyzer", layout="wide")
 
@@ -834,6 +854,106 @@ def compute_btst_signal(full_df, atr_val):
     }
 
 
+# ============================================================================
+# 📊 STOCK F&O HELPER FUNCTIONS (used by the Stock F&O Watchlist section below)
+# ============================================================================
+
+def get_strike_step(price):
+    """Approximate NSE options strike-interval spacing by price band. Actual
+    ladders vary per stock - always verify the real strike ladder on your
+    broker's option chain before placing an order."""
+    if price < 250:
+        return 5
+    elif price < 1000:
+        return 10
+    elif price < 2500:
+        return 20
+    elif price < 5000:
+        return 50
+    else:
+        return 100
+
+
+def next_monthly_expiry():
+    """Rough estimate of the current/next monthly F&O expiry as the last
+    Thursday of the month. NSE expiry days can shift around exchange
+    holidays or regulatory changes - always confirm against the official
+    NSE trading calendar before relying on this for a real trade."""
+    import calendar
+    today = _dt_module.date.today()
+
+    def last_thursday(year, month):
+        last_day = calendar.monthrange(year, month)[1]
+        d = _dt_module.date(year, month, last_day)
+        while d.weekday() != 3:  # Thursday = 3
+            d -= _dt_module.timedelta(days=1)
+        return d
+
+    exp = last_thursday(today.year, today.month)
+    if exp < today:
+        if today.month == 12:
+            exp = last_thursday(today.year + 1, 1)
+        else:
+            exp = last_thursday(today.year, today.month + 1)
+    return exp
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def check_fo_ban_list():
+    """Best-effort fetch of NSE's live F&O securities-in-ban list. NSE's API
+    frequently blocks non-browser/automated requests; if the fetch fails,
+    this returns None so the app can honestly show 'Unverified' status
+    instead of falsely claiming a stock is safe to trade."""
+    try:
+        url = "https://www.nseindia.com/api/liveEquity-derivatives?index=sec_ban"
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json",
+            "Referer": "https://www.nseindia.com/",
+        })
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            raw = resp.read()
+        import json
+        data = json.loads(raw)
+        banned = set()
+        for row in data.get("data", []):
+            sym = row.get("symbol")
+            if sym:
+                banned.add(sym)
+        return banned
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def analyze_stock(ticker_, period_="1y"):
+    """Runs the SAME Supertrend+ADX+rule-engine pipeline used for Nifty/Sensex
+    on an individual F&O stock ticker. Kept as a separate cached function
+    (rather than reusing load_and_process) because stocks don't need the
+    live-candle-patch logic tied to index tickers, and to avoid cache-key
+    collisions between index and stock lookups."""
+    raw = data_fetcher.fetch_history(ticker_, period_, cfg.INTERVAL)
+    enriched = indicators.add_all_indicators(raw)
+    enriched = indicators.add_supertrend_adx(enriched)
+    scored = signal_engine.annotate_signals(enriched)
+    scored["ST_SIGNAL"] = scored.apply(signal_engine.supertrend_adx_signal, axis=1)
+
+    def combined(r):
+        adx_val = r.get("ADX", 0)
+        has_real_trend = pd.notna(adx_val) and adx_val >= 20
+        if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY" and has_real_trend:
+            return "STRONG BUY"
+        if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL" and has_real_trend:
+            return "STRONG SELL"
+        if r["SIGNAL"] == "HOLD" and r["ST_SIGNAL"] == "HOLD":
+            return "HOLD"
+        return "MIXED / CAUTION"
+
+    scored["FINAL_SIGNAL"] = scored.apply(combined, axis=1)
+    scored["ATR14"] = compute_atr(scored, period=14)
+    return scored
+
+
 # Recompute automatically on every rerun (including the page's own 2-min
 # auto-refresh cycle) instead of only when the button is clicked. The
 # @st.cache_data(ttl=300) on load_and_process already prevents excessive
@@ -1302,6 +1422,148 @@ st.plotly_chart(eq_fig, use_container_width=True)
 st.dataframe(
     df[["Close", "RSI", "MACD", "SCORE", "SIGNAL", "ADX", "ST_SIGNAL", "FINAL_SIGNAL"]].tail(20).sort_index(ascending=False),
     use_container_width=True
+)
+
+# ============================================================================
+# 📊 STOCK F&O WATCHLIST — separate section, 10 selective F&O stocks
+# (Futures + Options), independent of the Index selector above.
+# ============================================================================
+st.markdown("---")
+st.header("📊 Stock F&O Watchlist — Top 10 Selective Picks")
+st.caption(
+    "Selected for liquidity, Nifty-50 F&O eligibility, and sector diversification "
+    "(banking, IT, energy, auto, infra, NBFC). Uses the EXACT SAME rule-based "
+    "Supertrend + ADX + RSI/MACD engine as the Nifty/Sensex signals above. "
+    "⚠️ This is NOT a guarantee of 10-15% profit or any specific return — some "
+    "calls will be wrong. Trade with proper position sizing and stop-losses."
+)
+
+fo_ban_set = check_fo_ban_list()
+expiry_date = next_monthly_expiry()
+days_to_expiry = (expiry_date - _dt_module.date.today()).days
+
+st.caption(
+    f"📅 Next monthly F&O expiry (approx., last Thursday): **{expiry_date.strftime('%d-%b-%Y')}** "
+    f"({days_to_expiry} calendar days away). Verify against the exchange's official calendar — "
+    "expiry dates can shift around holidays."
+)
+
+if fo_ban_set is None:
+    st.warning(
+        "⚠️ Could not verify today's live NSE F&O ban list right now (feed blocked/unavailable). "
+        "Please cross-check the ban list on NSE's website before placing any F&O trade."
+    )
+
+fo_tab_futures, fo_tab_options = st.tabs(["📄 Futures", "🎯 Options (CE/PE)"])
+
+stock_results = {}
+for stock_name, stock_ticker in STOCKS.items():
+    try:
+        sdf = analyze_stock(stock_ticker, "1y")
+        s_quote = fetch_live_quote(stock_ticker)
+        latest_s = sdf.iloc[-1]
+        explain_s = signal_engine.explain_latest(latest_s)
+        conf_s, dir_s, agree_s, total_s, strength_s = compute_confidence(latest_s, explain_s)
+        plan_s = compute_trade_plan(latest_s, latest_s["FINAL_SIGNAL"], latest_s["ATR14"])
+        stock_results[stock_name] = {
+            "ticker": stock_ticker, "df": sdf, "latest": latest_s,
+            "quote": s_quote, "confidence": conf_s, "direction": dir_s, "plan": plan_s,
+        }
+    except Exception as e:
+        stock_results[stock_name] = {"error": str(e)}
+
+with fo_tab_futures:
+    rows = []
+    for stock_name, r in stock_results.items():
+        if "error" in r:
+            rows.append({"Stock": stock_name, "Signal": "ERROR", "Note": r["error"]})
+            continue
+        latest_s = r["latest"]
+        plan_s = r["plan"]
+        s_quote = r["quote"]
+        symbol_root = r["ticker"].replace(".NS", "")
+        banned = (fo_ban_set is not None) and (symbol_root in fo_ban_set)
+        fo_status = "🚫 BANNED TODAY" if banned else ("✅ Tradable" if fo_ban_set is not None else "❔ Unverified")
+        rows.append({
+            "Stock": stock_name,
+            "LTP": f"{s_quote['price']:,.2f}" if s_quote else f"{latest_s['Close']:,.2f}",
+            "Day Chg %": f"{s_quote['pct_change']:+.2f}%" if s_quote else "N/A",
+            "Signal": latest_s["FINAL_SIGNAL"],
+            "Confidence": f"{r['confidence']}%",
+            "ADX": f"{latest_s['ADX']:.1f}",
+            "Entry": f"{plan_s['entry']:,.2f}" if plan_s else "-",
+            "Stop-Loss": f"{plan_s['stop_loss']:,.2f}" if plan_s else "-",
+            "Target": f"{plan_s['target']:,.2f}" if plan_s else "-",
+            "R:R": f"1:{plan_s['rr_ratio']:.1f}" if plan_s else "-",
+            "F&O Status": fo_status,
+        })
+    fut_table = pd.DataFrame(rows)
+    st.dataframe(fut_table, use_container_width=True, hide_index=True)
+    st.caption(
+        "Stop-Loss = 1.5×ATR, Target = 3×ATR (built-in 1:2 risk-reward) — identical methodology to the "
+        "index Trade Plan above. Futures require full SPAN + exposure margin — check your broker before entering."
+    )
+
+with fo_tab_options:
+    opt_rows = []
+    for stock_name, r in stock_results.items():
+        if "error" in r:
+            opt_rows.append({"Stock": stock_name, "Signal": "ERROR"})
+            continue
+        latest_s = r["latest"]
+        s_quote = r["quote"]
+        entry_price = s_quote["price"] if s_quote else latest_s["Close"]
+        atr_s = latest_s["ATR14"]
+        step = get_strike_step(entry_price)
+        atm_strike = round(entry_price / step) * step
+        signal_s = latest_s["FINAL_SIGNAL"]
+        symbol_root = r["ticker"].replace(".NS", "")
+        banned = (fo_ban_set is not None) and (symbol_root in fo_ban_set)
+        fo_status = "🚫 BANNED TODAY" if banned else ("✅ Tradable" if fo_ban_set is not None else "❔ Unverified")
+
+        if signal_s == "STRONG BUY":
+            option_type, strike_suggestion = "CE (Call)", atm_strike
+        elif signal_s == "STRONG SELL":
+            option_type, strike_suggestion = "PE (Put)", atm_strike
+        else:
+            option_type, strike_suggestion = "WAIT", None
+
+        if option_type != "WAIT":
+            premium_est = max(atr_s * 0.5, entry_price * 0.01)
+            sl_premium = premium_est * 0.5
+            target_premium = premium_est * 1.5
+        else:
+            premium_est = sl_premium = target_premium = None
+
+        opt_rows.append({
+            "Stock": stock_name,
+            "Spot": f"{entry_price:,.2f}",
+            "Call": option_type,
+            "Suggested Strike": f"{strike_suggestion:,.0f}" if strike_suggestion else "-",
+            "Est. Entry Premium*": f"~{premium_est:,.1f}" if premium_est else "-",
+            "Premium Stop*": f"~{sl_premium:,.1f}" if sl_premium else "-",
+            "Premium Target*": f"~{target_premium:,.1f}" if target_premium else "-",
+            "Expiry": expiry_date.strftime("%d-%b"),
+            "F&O Status": fo_status,
+        })
+    opt_table = pd.DataFrame(opt_rows)
+    st.dataframe(opt_table, use_container_width=True, hide_index=True)
+    st.caption(
+        "*Premiums are ROUGH ATR-based ESTIMATES only — NOT live option-chain data. Always confirm actual "
+        "premium, bid-ask spread, and open interest on your broker's option chain before entering. Strike "
+        "suggestion = nearest approximate ATM strike — verify the exact strike ladder on NSE/your broker. "
+        "Once Zerodha Kite Connect is integrated, this will pull REAL live premiums and Open Interest instead "
+        f"of estimates. ⚠️ Only {days_to_expiry} day(s) to expiry — " +
+        ("high theta-decay risk, consider smaller size or skip." if days_to_expiry <= 3 else
+         "manageable time value remaining.")
+    )
+
+st.warning(
+    "🚫 Disclaimer: This Stock F&O Watchlist is a rule-based technical screener (Supertrend + ADX + "
+    "RSI/MACD) — identical in logic to the Nifty/Sensex signals above. It is NOT a guarantee of 10-15% "
+    "profit or any specific return. F&O trading carries a high risk of rapid, total loss of capital, "
+    "especially in options near expiry. This is an educational tool only — not investment advice. "
+    "Trade only what you can afford to lose."
 )
 
 st.caption("Not financial advice. For educational use only.")
