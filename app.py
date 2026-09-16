@@ -535,9 +535,40 @@ with st.sidebar:
 
 ticker = cfg.INDICES[index_name]
 
-@st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def load_and_process(ticker, period):
     raw = data_fetcher.fetch_history(ticker, period, cfg.INTERVAL)
+
+    # --- Patch in TODAY'S LIVE price as the most recent candle so that
+    # Supertrend / ADX / the rule engine react to the current intraday
+    # move, instead of being frozen on yesterday's completed daily close
+    # while the market is still open. Falls back silently to plain daily
+    # data if the live quote is unavailable. ---
+    try:
+        live = fetch_live_quote(ticker)
+        if live is not None and len(raw) > 0:
+            today_ist = (pd.Timestamp.utcnow() + pd.Timedelta(hours=5, minutes=30)).normalize()
+            last_idx = raw.index[-1].normalize()
+            live_open = live["price"] - live["change"]
+            new_row = pd.DataFrame(
+                {
+                    "Open": [live_open],
+                    "High": [max(live["high"], live["price"])],
+                    "Low": [min(live["low"], live["price"])],
+                    "Close": [live["price"]],
+                    "Volume": [raw["Volume"].iloc[-1] if "Volume" in raw.columns else 0],
+                },
+                index=[today_ist],
+            )
+            if last_idx == today_ist:
+                # Today's daily candle already exists (e.g. stale/incomplete) - replace it
+                raw = pd.concat([raw.iloc[:-1], new_row])
+            else:
+                # Today's candle hasn't formed yet in the daily feed - append it
+                raw = pd.concat([raw, new_row])
+    except Exception:
+        pass
+
     enriched = indicators.add_all_indicators(raw)
     enriched = indicators.add_supertrend_adx(enriched)
     scored = signal_engine.annotate_signals(enriched)
@@ -794,14 +825,20 @@ def compute_btst_signal(full_df, atr_val):
     }
 
 
-if run_button or "last_df" not in st.session_state:
-    try:
-        st.session_state["last_df"] = load_and_process(ticker, period)
-    except Exception as e:
-        st.error(f"Failed to fetch data: {e}")
-        st.stop()
+# Recompute automatically on every rerun (including the page's own 2-min
+# auto-refresh cycle) instead of only when the button is clicked. The
+# @st.cache_data(ttl=300) on load_and_process already prevents excessive
+# recomputation - it only actually re-fetches/re-processes at most once
+# every 5 minutes, or immediately if you click "Fetch data & analyze".
+if run_button:
+    load_and_process.clear()
 
-full_df = st.session_state.get("last_df")
+try:
+    full_df = load_and_process(ticker, period)
+except Exception as e:
+    st.error(f"Failed to fetch data: {e}")
+    st.stop()
+
 if full_df is None:
     st.info("Click 'Fetch data & analyze' to begin.")
     st.stop()
