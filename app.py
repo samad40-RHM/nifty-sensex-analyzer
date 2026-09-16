@@ -575,9 +575,16 @@ def load_and_process(ticker, period):
     scored["ST_SIGNAL"] = scored.apply(signal_engine.supertrend_adx_signal, axis=1)
 
     def combined(r):
-        if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY":
+        # --- STRICTER "STRONG" definition: requires directional agreement
+        # AND a genuine trend (ADX >= 20), not just two indicators pointing
+        # the same way in a choppy/sideways market. This trades signal
+        # FREQUENCY for signal RELIABILITY - fewer STRONG calls, but each
+        # one is backed by real trend strength, not noise. ---
+        adx_val = r.get("ADX", 0)
+        has_real_trend = pd.notna(adx_val) and adx_val >= 20
+        if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY" and has_real_trend:
             return "STRONG BUY"
-        if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL":
+        if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL" and has_real_trend:
             return "STRONG SELL"
         if r["SIGNAL"] == "HOLD" and r["ST_SIGNAL"] == "HOLD":
             return "HOLD"
@@ -606,9 +613,11 @@ def fetch_intraday(ticker, yf_period, yf_interval):
             scored["ST_SIGNAL"] = scored.apply(signal_engine.supertrend_adx_signal, axis=1)
 
             def combined(r):
-                if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY":
+                adx_val = r.get("ADX", 0)
+                has_real_trend = pd.notna(adx_val) and adx_val >= 20
+                if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY" and has_real_trend:
                     return "STRONG BUY"
-                if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL":
+                if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL" and has_real_trend:
                     return "STRONG SELL"
                 if r["SIGNAL"] == "HOLD" and r["ST_SIGNAL"] == "HOLD":
                     return "HOLD"
@@ -975,9 +984,16 @@ def load_for_btst(ticker_, period_):
     scored["ST_SIGNAL"] = scored.apply(signal_engine.supertrend_adx_signal, axis=1)
 
     def combined(r):
-        if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY":
+        # --- STRICTER "STRONG" definition: requires directional agreement
+        # AND a genuine trend (ADX >= 20), not just two indicators pointing
+        # the same way in a choppy/sideways market. This trades signal
+        # FREQUENCY for signal RELIABILITY - fewer STRONG calls, but each
+        # one is backed by real trend strength, not noise. ---
+        adx_val = r.get("ADX", 0)
+        has_real_trend = pd.notna(adx_val) and adx_val >= 20
+        if r["SIGNAL"] == "BUY" and r["ST_SIGNAL"] == "BUY" and has_real_trend:
             return "STRONG BUY"
-        if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL":
+        if r["SIGNAL"] == "SELL" and r["ST_SIGNAL"] == "SELL" and has_real_trend:
             return "STRONG SELL"
         if r["SIGNAL"] == "HOLD" and r["ST_SIGNAL"] == "HOLD":
             return "HOLD"
