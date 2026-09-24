@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import yfinance as yf
 import datetime
 import urllib.request
+import json as _json_module
 import xml.etree.ElementTree as ET
 import logger
 import config as cfg
@@ -26,6 +27,245 @@ STOCKS = {
     "Larsen & Toubro": "LT.NS",
     "Bajaj Finance": "BAJFINANCE.NS",
 }
+
+
+# ============================================================================
+# 📈 OPTION CHAIN OPEN INTEREST (OI) ANALYSIS — Nifty (live, NSE) + Sensex
+# (best-effort, BSE). Mirrors the layout of public OI-visualization tools:
+# Call OI vs Put OI bars by strike, Total OI vs Change-in-OI toggle, PCR,
+# per-strike buildup tags (Long/Short Buildup, Short Covering, Long
+# Unwinding), and highlighted support/resistance strikes.
+# ============================================================================
+
+NSE_OC_INDEX_URLS = {
+    "NIFTY": "https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY",
+}
+
+NSE_OC_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/option-chain",
+}
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_nse_option_chain(symbol="NIFTY"):
+    """
+    Best-effort live pull of NSE's public option-chain JSON for an index.
+    NSE requires a valid session cookie obtained by first hitting a normal
+    HTML page with browser-like headers, THEN calling the API endpoint with
+    that same cookie jar - calling the API cold (no cookie) is what usually
+    gets silently blocked/403'd, especially from a cloud server IP (like
+    Streamlit Cloud) rather than a residential browser IP.
+
+    Returns a dict with 'records' (raw NSE json) on success, or None on
+    failure - callers MUST handle None honestly (show "unavailable"),
+    never fabricate OI numbers as a fallback.
+    """
+    try:
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+        warmup_req = urllib.request.Request("https://www.nseindia.com/option-chain", headers=NSE_OC_HEADERS)
+        opener.open(warmup_req, timeout=6)
+
+        api_req = urllib.request.Request(NSE_OC_INDEX_URLS.get(symbol, NSE_OC_INDEX_URLS["NIFTY"]), headers=NSE_OC_HEADERS)
+        with opener.open(api_req, timeout=6) as resp:
+            raw = resp.read()
+        data = _json_module.loads(raw)
+        if "records" not in data or "data" not in data["records"]:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_bse_option_chain(symbol="SENSEX"):
+    """
+    Best-effort live pull attempt for Sensex's option-chain from BSE's
+    public API. HONEST LIMITATION: BSE's derivatives data feed is far less
+    consistently scriptable than NSE's, and frequently blocks non-browser
+    requests entirely. If this fails (very likely on a cloud host), the
+    caller shows "Live OI data unavailable" rather than inventing numbers.
+    """
+    try:
+        url = "https://api.bseindia.com/BseIndiaAPI/api/ddlOptionChain/w?scrip_cd=1&Type=IDX"
+        req = urllib.request.Request(url, headers={
+            **NSE_OC_HEADERS,
+            "Referer": "https://www.bseindia.com/",
+            "Origin": "https://www.bseindia.com",
+        })
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            raw = resp.read()
+        data = _json_module.loads(raw)
+        if not data:
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def parse_nse_option_chain(raw_data, expiry=None):
+    """
+    Converts NSE's raw option-chain JSON into a tidy per-strike DataFrame
+    with Call OI, Put OI, their changes, and classifies each strike's
+    positioning using the standard 4-quadrant OI+price buildup logic:
+      - Long Buildup    : price UP   + OI UP    (fresh long positions - bullish)
+      - Short Buildup    : price DOWN + OI UP    (fresh short positions - bearish)
+      - Short Covering    : price UP   + OI DOWN  (shorts exiting - bullish, often sharp)
+      - Long Unwinding    : price DOWN + OI DOWN  (longs exiting - bearish)
+    Buildup classification uses each strike's OWN option price change (the
+    premium's LTP change), NOT the underlying index's price change - this
+    matches how real option-chain OI tools (incl. the one you referenced)
+    tag buildup per strike/per option-side, not just per-index-direction.
+    """
+    records = raw_data["records"]
+    all_expiries = records.get("expiryDates", [])
+    underlying_value = records.get("underlyingValue", None)
+    chosen_expiry = expiry if expiry in all_expiries else (all_expiries[0] if all_expiries else None)
+
+    rows = []
+    for item in records.get("data", []):
+        if chosen_expiry and item.get("expiryDate") != chosen_expiry:
+            continue
+        strike = item.get("strikePrice")
+        ce = item.get("CE", {})
+        pe = item.get("PE", {})
+
+        ce_oi = ce.get("openInterest", 0) or 0
+        ce_chg_oi = ce.get("changeinOpenInterest", 0) or 0
+        ce_ltp_chg = ce.get("change", 0) or 0
+        pe_oi = pe.get("openInterest", 0) or 0
+        pe_chg_oi = pe.get("changeinOpenInterest", 0) or 0
+        pe_ltp_chg = pe.get("change", 0) or 0
+
+        def buildup(oi_chg, price_chg):
+            if oi_chg > 0 and price_chg > 0:
+                return "Long Buildup"
+            if oi_chg > 0 and price_chg < 0:
+                return "Short Buildup"
+            if oi_chg < 0 and price_chg > 0:
+                return "Short Covering"
+            if oi_chg < 0 and price_chg < 0:
+                return "Long Unwinding"
+            return "Neutral"
+
+        rows.append({
+            "Strike": strike,
+            "Call OI": ce_oi,
+            "Call Chg OI": ce_chg_oi,
+            "Call LTP Chg": ce_ltp_chg,
+            "Call Buildup": buildup(ce_chg_oi, ce_ltp_chg) if ce else "-",
+            "Put OI": pe_oi,
+            "Put Chg OI": pe_chg_oi,
+            "Put LTP Chg": pe_ltp_chg,
+            "Put Buildup": buildup(pe_chg_oi, pe_ltp_chg) if pe else "-",
+        })
+
+    oi_df = pd.DataFrame(rows).sort_values("Strike").reset_index(drop=True)
+    return oi_df, underlying_value, chosen_expiry, all_expiries
+
+
+def compute_pcr(oi_df):
+    """Put-Call Ratio = total Put OI / total Call OI. Standard reading:
+    PCR > 1 => more put writing than call writing => generally bullish tilt;
+    PCR < 0.7 => call-heavy => generally bearish tilt; in between => neutral.
+    This is a widely-used HEURISTIC, not a guaranteed directional signal."""
+    total_call_oi = oi_df["Call OI"].sum()
+    total_put_oi = oi_df["Put OI"].sum()
+    pcr = (total_put_oi / total_call_oi) if total_call_oi > 0 else None
+    if pcr is None:
+        read, color = "N/A", "#888"
+    elif pcr > 1.2:
+        read, color = "BULLISH (Put-heavy)", "#0b8043"
+    elif pcr < 0.7:
+        read, color = "BEARISH (Call-heavy)", "#c5221f"
+    else:
+        read, color = "NEUTRAL", "#e37400"
+    return pcr, read, color, total_call_oi, total_put_oi
+
+
+def render_option_chain_section(display_name, oi_df, underlying_value, chosen_expiry, all_expiries, data_source_label):
+    """Renders the full OI section UI (chart + PCR + buildup table + support/
+    resistance) for one index. Shared by both Nifty and Sensex tabs so the
+    layout stays byte-for-byte identical between them."""
+    if oi_df is None or oi_df.empty:
+        st.error(
+            f"❔ Live OI data unavailable for {display_name} right now ({data_source_label} request was "
+            "blocked or timed out - common on cloud-hosted servers vs. a residential browser IP). "
+            "No fabricated numbers are shown. Please retry in a minute, or check the source site directly."
+        )
+        return
+
+    top_c1, top_c2, top_c3 = st.columns([1.4, 1, 1])
+    with top_c1:
+        if all_expiries:
+            picked_expiry = st.selectbox(
+                f"Expiry ({display_name})", all_expiries,
+                index=all_expiries.index(chosen_expiry) if chosen_expiry in all_expiries else 0,
+                key=f"expiry_select_{display_name}"
+            )
+        else:
+            picked_expiry = chosen_expiry
+    with top_c2:
+        oi_view = st.radio(
+            "View", ["Total OI", "Change in OI"], horizontal=True, key=f"oi_view_{display_name}"
+        )
+    with top_c3:
+        if underlying_value:
+            st.metric(f"{display_name} Spot", f"{underlying_value:,.2f}")
+
+    pcr, pcr_read, pcr_color, total_call_oi, total_put_oi = compute_pcr(oi_df)
+    resistance_strike = oi_df.loc[oi_df["Call OI"].idxmax(), "Strike"] if not oi_df["Call OI"].isna().all() else None
+    support_strike = oi_df.loc[oi_df["Put OI"].idxmax(), "Strike"] if not oi_df["Put OI"].isna().all() else None
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total Call OI", f"{total_call_oi:,.0f}")
+    m2.metric("Total Put OI", f"{total_put_oi:,.0f}")
+    m3.metric("PCR", f"{pcr:.2f}" if pcr else "N/A")
+    m4.markdown(
+        f"<div style='padding-top:8px'><span style='color:{pcr_color};font-weight:700'>{pcr_read}</span></div>",
+        unsafe_allow_html=True
+    )
+
+    sr1, sr2 = st.columns(2)
+    sr1.info(f"🟢 **Support (max Put OI):** strike **{support_strike:,.0f}**" if support_strike else "Support: N/A")
+    sr2.warning(f"🔴 **Resistance (max Call OI):** strike **{resistance_strike:,.0f}**" if resistance_strike else "Resistance: N/A")
+
+    call_col = "Call OI" if oi_view == "Total OI" else "Call Chg OI"
+    put_col = "Put OI" if oi_view == "Total OI" else "Put Chg OI"
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=oi_df["Strike"], y=oi_df[call_col], name="Call OI", marker_color="#c5221f"))
+    fig.add_trace(go.Bar(x=oi_df["Strike"], y=oi_df[put_col], name="Put OI", marker_color="#0b8043"))
+    if underlying_value:
+        fig.add_vline(x=underlying_value, line_dash="dash", line_color="#333",
+                      annotation_text="Spot", annotation_position="top")
+    fig.update_layout(
+        barmode="group", xaxis_title="Strike Price",
+        yaxis_title=oi_view, height=440,
+        title=f"{display_name} — Call vs Put {oi_view} by Strike (Expiry: {picked_expiry})",
+        legend=dict(orientation="h", y=1.08)
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("**Per-strike Buildup Classification**")
+    display_df = oi_df.copy()
+    for col in ["Call OI", "Call Chg OI", "Put OI", "Put Chg OI"]:
+        display_df[col] = display_df[col].apply(lambda v: f"{v:,.0f}")
+    st.dataframe(
+        display_df[["Strike", "Call OI", "Call Chg OI", "Call Buildup", "Put OI", "Put Chg OI", "Put Buildup"]],
+        use_container_width=True, hide_index=True
+    )
+    st.caption(
+        "Buildup logic: **Long Buildup** = OI↑ + premium↑ (fresh longs, bullish) · **Short Buildup** = OI↑ + "
+        "premium↓ (fresh shorts, bearish) · **Short Covering** = OI↓ + premium↑ (shorts exiting, bullish) · "
+        "**Long Unwinding** = OI↓ + premium↓ (longs exiting, bearish). Data source: " + data_source_label + ". "
+        "PCR and buildup tags are widely-used HEURISTICS, not guaranteed directional signals — "
+        "cross-check with the Nifty/Sensex trend signals above before acting."
+    )
+
 
 st.set_page_config(page_title="Nifty & Sensex Daily Analyzer", layout="wide")
 
@@ -1598,5 +1838,52 @@ st.warning(
     "especially in options near expiry. This is an educational tool only — not investment advice. "
     "Trade only what you can afford to lose."
 )
+
+# ============================================================================
+# 📈 OPTION CHAIN OI ANALYSIS — Nifty (live) + Sensex (best-effort)
+# Layout mirrors public OI-visualization tools: Call/Put OI bars by strike,
+# Total OI vs Change-in-OI toggle, PCR, buildup tags, support/resistance.
+# ============================================================================
+st.markdown("---")
+st.header("📈 Option Chain Open Interest (OI) Analysis")
+st.caption(
+    "Live per-strike Call/Put Open Interest for NIFTY (from NSE's public option-chain feed) and a "
+    "best-effort attempt for SENSEX (from BSE's feed, which is far less reliably scriptable). "
+    "If a live pull is blocked (common on cloud servers), this section shows an honest "
+    "'unavailable' message rather than fabricated numbers."
+)
+
+oi_tab_nifty, oi_tab_sensex = st.tabs(["📊 NIFTY", "📊 SENSEX"])
+
+with oi_tab_nifty:
+    nifty_raw = fetch_nse_option_chain("NIFTY")
+    if nifty_raw is not None:
+        nifty_oi_df, nifty_spot, nifty_expiry, nifty_expiries = parse_nse_option_chain(nifty_raw)
+        render_option_chain_section("NIFTY", nifty_oi_df, nifty_spot, nifty_expiry, nifty_expiries, "NSE live option-chain API")
+    else:
+        st.error(
+            "❔ Live OI data unavailable for NIFTY right now — NSE's option-chain API blocked or timed out "
+            "this request (this frequently happens from cloud-hosted servers, e.g. Streamlit Cloud, since NSE "
+            "restricts non-browser traffic). No fabricated numbers are shown. Please retry shortly, or check "
+            "nseindia.com's option chain directly for live figures."
+        )
+
+with oi_tab_sensex:
+    st.caption(
+        "⚠️ Honest limitation: Sensex options trade on the BSE, whose public option-chain feed is far less "
+        "consistently scriptable than NSE's. This is a best-effort attempt — it may fail or show stale data."
+    )
+    sensex_raw = fetch_bse_option_chain("SENSEX")
+    if sensex_raw is not None and isinstance(sensex_raw, dict) and "records" in sensex_raw:
+        sensex_oi_df, sensex_spot, sensex_expiry, sensex_expiries = parse_nse_option_chain(sensex_raw)
+        render_option_chain_section("SENSEX", sensex_oi_df, sensex_spot, sensex_expiry, sensex_expiries, "BSE option-chain API (best-effort)")
+    else:
+        st.error(
+            "❔ Live OI data unavailable for SENSEX right now — BSE's option-chain feed either blocked this "
+            "request, returned an unexpected format, or is not reliably exposing this data publicly. "
+            "No fabricated numbers are shown. For live Sensex OI, please check bseindia.com or your broker's "
+            "option chain directly. (This is a known limitation, not a bug we can fully fix without a paid "
+            "broker API like Kite Connect, which does expose BSE index option-chain data reliably.)"
+        )
 
 st.caption("Not financial advice. For educational use only.")
