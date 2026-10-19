@@ -15,6 +15,29 @@ import signal_engine
 import backtester
 import datetime as _dt_module  # aliased only to avoid clashing with the existing `datetime` import above
 
+# Candidate universe for the dynamic F&O screener (liquid NSE F&O large-caps).
+# EDIT THIS LIST as NSE revises the F&O segment (NSE's official lot-size list is
+# the source of truth). Tickers that fail to download are skipped and reported.
+FO_UNIVERSE = {
+    "Reliance Industries": "RELIANCE.NS", "HDFC Bank": "HDFCBANK.NS", "ICICI Bank": "ICICIBANK.NS",
+    "State Bank of India": "SBIN.NS", "Axis Bank": "AXISBANK.NS", "Kotak Mahindra Bank": "KOTAKBANK.NS",
+    "IndusInd Bank": "INDUSINDBK.NS", "Bank of Baroda": "BANKBARODA.NS", "Punjab National Bank": "PNB.NS",
+    "TCS": "TCS.NS", "Infosys": "INFY.NS", "HCL Technologies": "HCLTECH.NS", "Wipro": "WIPRO.NS",
+    "Tech Mahindra": "TECHM.NS", "Larsen & Toubro": "LT.NS", "Bajaj Finance": "BAJFINANCE.NS",
+    "Bajaj Finserv": "BAJAJFINSV.NS", "Shriram Finance": "SHRIRAMFIN.NS", "HDFC Life": "HDFCLIFE.NS",
+    "SBI Life": "SBILIFE.NS", "Hindustan Unilever": "HINDUNILVR.NS", "ITC": "ITC.NS",
+    "Nestle India": "NESTLEIND.NS", "Asian Paints": "ASIANPAINT.NS", "Titan": "TITAN.NS",
+    "Maruti Suzuki": "MARUTI.NS", "Mahindra & Mahindra": "M&M.NS", "Eicher Motors": "EICHERMOT.NS",
+    "Bajaj Auto": "BAJAJ-AUTO.NS", "Hero MotoCorp": "HEROMOTOCO.NS", "Sun Pharma": "SUNPHARMA.NS",
+    "Dr Reddy's": "DRREDDY.NS", "Cipla": "CIPLA.NS", "Divi's Labs": "DIVISLAB.NS",
+    "Tata Steel": "TATASTEEL.NS", "JSW Steel": "JSWSTEEL.NS", "Hindalco": "HINDALCO.NS",
+    "Vedanta": "VEDL.NS", "Coal India": "COALINDIA.NS", "ONGC": "ONGC.NS", "NTPC": "NTPC.NS",
+    "Power Grid": "POWERGRID.NS", "Tata Power": "TATAPOWER.NS", "Adani Enterprises": "ADANIENT.NS",
+    "Adani Ports": "ADANIPORTS.NS", "UltraTech Cement": "ULTRACEMCO.NS", "Grasim": "GRASIM.NS",
+    "Bharti Airtel": "BHARTIARTL.NS", "Zomato (Eternal)": "ETERNAL.NS", "Trent": "TRENT.NS",
+    "Bharat Electronics": "BEL.NS", "HAL": "HAL.NS",
+}
+
 STOCKS = {
     "Reliance Industries": "RELIANCE.NS",
     "HDFC Bank": "HDFCBANK.NS",
@@ -1303,6 +1326,50 @@ def check_fo_ban_list():
         return None
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def scan_fo_universe(universe_items, period_="1y"):
+    """Runs the Supertrend+ADX+RSI/MACD engine on every stock in the universe
+    and returns a list of per-stock result dicts plus a list of tickers that
+    failed. Cached 15 min so the (slow) scan doesn't rerun on every refresh."""
+    results, failed = [], []
+    for name, tkr in universe_items:
+        try:
+            sdf = analyze_stock(tkr, period_)
+            latest = sdf.iloc[-1]
+            explain = signal_engine.explain_latest(latest)
+            conf, dir_, _a, _t, _s = compute_confidence(latest, explain)
+            plan = compute_trade_plan(latest, latest["FINAL_SIGNAL"], latest["ATR14"])
+            closes = sdf["Close"].dropna()
+            ret5 = (closes.iloc[-1] / closes.iloc[-6] - 1) * 100 if len(closes) > 6 else 0.0
+            results.append({"name": name, "ticker": tkr, "latest": latest, "confidence": conf,
+                            "direction": dir_, "plan": plan, "ret5": float(ret5)})
+        except Exception:
+            failed.append(name)
+    return results, failed
+
+
+def select_top_picks(results, rank_mode, direction, banned_set, top_n=10):
+    """Filters + ranks scan results. 'Signal strength' puts STRONG BUY/SELL
+    first (then by confidence, ADX); '5-day momentum' ranks by absolute
+    5-session move. Banned F&O stocks are excluded when the ban list is known."""
+    picks = []
+    for r in results:
+        sig = r["latest"]["FINAL_SIGNAL"]
+        if banned_set is not None and r["ticker"].replace(".NS", "") in banned_set:
+            continue
+        if direction == "Bullish only" and sig != "STRONG BUY":
+            continue
+        if direction == "Bearish only" and sig != "STRONG SELL":
+            continue
+        picks.append(r)
+    if rank_mode == "5-day momentum":
+        picks.sort(key=lambda r: abs(r["ret5"]), reverse=True)
+    else:
+        picks.sort(key=lambda r: (r["latest"]["FINAL_SIGNAL"] in ("STRONG BUY", "STRONG SELL"),
+                                  r["confidence"], float(r["latest"].get("ADX", 0) or 0)), reverse=True)
+    return picks[:top_n]
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def analyze_stock(ticker_, period_="1y"):
     """Runs the SAME Supertrend+ADX+rule-engine pipeline used for Nifty/Sensex
@@ -1808,10 +1875,10 @@ st.dataframe(
 # (Futures + Options), independent of the Index selector above.
 # ============================================================================
 st.markdown("---")
-st.header("📊 Stock F&O Watchlist — Top 10 Selective Picks")
+st.header("📊 Stock F&O Screener — Top 10 Picks (auto-refreshing)")
 st.caption(
-    "Selected for liquidity, Nifty-50 F&O eligibility, and sector diversification "
-    "(banking, IT, energy, auto, infra, NBFC). Uses the EXACT SAME rule-based "
+    f"Scans {len(FO_UNIVERSE)} liquid F&O stocks and re-ranks them every ~15 minutes, so the top 10 CHANGES as "
+    "trends change. Uses the EXACT SAME rule-based "
     "Supertrend + ADX + RSI/MACD engine as the Nifty/Sensex signals above. "
     "⚠️ This is NOT a guarantee of 10-15% profit or any specific return — some "
     "calls will be wrong. Trade with proper position sizing and stop-losses."
@@ -1835,21 +1902,30 @@ if fo_ban_set is None:
 
 fo_tab_futures, fo_tab_options = st.tabs(["📄 Futures", "🎯 Options (CE/PE)"])
 
+ctl1, ctl2 = st.columns(2)
+rank_mode = ctl1.radio("Rank by", ["Signal strength", "5-day momentum"], horizontal=True, key="fo_rank_mode")
+direction_pick = ctl2.radio("Direction", ["All", "Bullish only", "Bearish only"], horizontal=True, key="fo_direction")
+
+with st.spinner(f"Scanning {len(FO_UNIVERSE)} F&O stocks (first load can take a minute; cached 15 min)..."):
+    scan_results, scan_failed = scan_fo_universe(tuple(FO_UNIVERSE.items()), "1y")
+
+top_picks = select_top_picks(scan_results, rank_mode, direction_pick, fo_ban_set, top_n=10)
+n_strong = sum(1 for r in scan_results if r["latest"]["FINAL_SIGNAL"] in ("STRONG BUY", "STRONG SELL"))
+st.caption(f"Scanned {len(scan_results)} stocks · {n_strong} currently have a STRONG BUY/SELL signal · showing top {len(top_picks)}."
+           + (f" Skipped (data unavailable): {', '.join(scan_failed)}." if scan_failed else ""))
+if not top_picks:
+    st.info("No stocks match the current filter right now. Try 'All' directions or the other ranking mode.")
+
 stock_results = {}
-for stock_name, stock_ticker in STOCKS.items():
+for r in top_picks:
     try:
-        sdf = analyze_stock(stock_ticker, "1y")
-        s_quote = fetch_live_quote(stock_ticker)
-        latest_s = sdf.iloc[-1]
-        explain_s = signal_engine.explain_latest(latest_s)
-        conf_s, dir_s, agree_s, total_s, strength_s = compute_confidence(latest_s, explain_s)
-        plan_s = compute_trade_plan(latest_s, latest_s["FINAL_SIGNAL"], latest_s["ATR14"])
-        stock_results[stock_name] = {
-            "ticker": stock_ticker, "df": sdf, "latest": latest_s,
-            "quote": s_quote, "confidence": conf_s, "direction": dir_s, "plan": plan_s,
-        }
-    except Exception as e:
-        stock_results[stock_name] = {"error": str(e)}
+        s_quote = fetch_live_quote(r["ticker"])
+    except Exception:
+        s_quote = None
+    stock_results[r["name"]] = {
+        "ticker": r["ticker"], "latest": r["latest"], "quote": s_quote,
+        "confidence": r["confidence"], "direction": r["direction"], "plan": r["plan"],
+    }
 
 with fo_tab_futures:
     rows = []
