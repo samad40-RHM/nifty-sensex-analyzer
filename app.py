@@ -30,6 +30,112 @@ STOCKS = {
 
 
 # ============================================================================
+# 🚀 IPO CALENDAR — weekly / monthly view of Active + Forthcoming IPOs
+# (Mainboard + SME) from NSE's public "upcoming issues" feed.
+# ============================================================================
+
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_nse_ipos():
+    """Best-effort pull of NSE's upcoming/active issues (Mainboard 'ipo' and
+    'sme'). Uses the same cookie warm-up approach as the option-chain fetch.
+    Returns a DataFrame, or None if NSE blocked/timed out (callers must show
+    an honest 'unavailable' message - never fabricate IPO data)."""
+    try:
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+        opener.open(urllib.request.Request("https://www.nseindia.com/market-data/all-upcoming-issues-ipo",
+                                           headers=NSE_OC_HEADERS), timeout=6)
+        rows = []
+        for cat, label in (("ipo", "Mainboard"), ("sme", "SME")):
+            try:
+                req = urllib.request.Request(
+                    f"https://www.nseindia.com/api/all-upcoming-issues?category={cat}",
+                    headers=NSE_OC_HEADERS)
+                with opener.open(req, timeout=6) as resp:
+                    data = _json_module.loads(resp.read())
+                for d in data if isinstance(data, list) else []:
+                    d = dict(d)
+                    d["Type"] = label
+                    rows.append(d)
+            except Exception:
+                continue
+        if not rows:
+            return None
+        return parse_ipo_rows(rows)
+    except Exception:
+        return None
+
+
+def parse_ipo_rows(rows):
+    """Normalizes raw NSE IPO records into a tidy DataFrame."""
+    import re
+    df = pd.DataFrame(rows)
+    for col in ["companyName", "issueStartDate", "issueEndDate", "issuePrice", "issueSize", "status", "symbol"]:
+        if col not in df.columns:
+            df[col] = None
+    df["Open"] = pd.to_datetime(df["issueStartDate"], format="%d-%b-%Y", errors="coerce")
+    df["Close"] = pd.to_datetime(df["issueEndDate"], format="%d-%b-%Y", errors="coerce")
+    df = df.dropna(subset=["Open", "Close"])
+
+    def upper_price(txt):
+        nums = re.findall(r"[\d,]+\.?\d*", str(txt))
+        nums = [float(n.replace(",", "")) for n in nums if n.replace(",", "").replace(".", "").isdigit()]
+        return max(nums) if nums else np.nan
+
+    df["UpperPrice"] = df["issuePrice"].apply(upper_price)
+    df["Shares"] = pd.to_numeric(df["issueSize"], errors="coerce")
+    df["SizeCr"] = (df["Shares"] * df["UpperPrice"] / 1e7).round(0)
+    df = df.drop_duplicates(subset=["symbol", "Open"]).sort_values("Open").reset_index(drop=True)
+    return df
+
+
+def ipo_period_bounds():
+    """Calendar windows in IST: this/next week (Mon-Sun) and this/next month."""
+    today = (pd.Timestamp.utcnow() + pd.Timedelta(hours=5, minutes=30)).tz_localize(None).normalize()
+    wk_start = today - pd.Timedelta(days=today.weekday())
+    wk_end = wk_start + pd.Timedelta(days=6)
+    m_start = today.replace(day=1)
+    nm_start = (m_start + pd.Timedelta(days=32)).replace(day=1)
+    nnm_start = (nm_start + pd.Timedelta(days=32)).replace(day=1)
+    return today, {
+        "This Week": (wk_start, wk_end),
+        "Next Week": (wk_start + pd.Timedelta(days=7), wk_end + pd.Timedelta(days=7)),
+        "This Month": (m_start, nm_start - pd.Timedelta(days=1)),
+        "Next Month": (nm_start, nnm_start - pd.Timedelta(days=1)),
+    }
+
+
+def render_ipo_table(ipo_df, start, end, today, label):
+    """Shows IPOs whose subscription window overlaps [start, end]."""
+    sel = ipo_df[(ipo_df["Open"] <= end) & (ipo_df["Close"] >= start)].copy()
+    st.caption(f"Window: {start.strftime('%d-%b-%Y')} → {end.strftime('%d-%b-%Y')}")
+    if sel.empty:
+        st.info(f"No IPOs listed on NSE's feed for {label.lower()} (yet). Newer issues get announced close to their open date.")
+        return
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total IPOs", len(sel))
+    c2.metric("Mainboard", int((sel["Type"] == "Mainboard").sum()))
+    c3.metric("SME", int((sel["Type"] == "SME").sum()))
+
+    def when(r):
+        if r["Open"] > today:
+            return f"Opens in {(r['Open'] - today).days} day(s)"
+        if r["Close"] >= today:
+            return "🟢 Open now" if r["Close"] > today else "🟠 Closes today"
+        return "Closed"
+
+    out = pd.DataFrame({
+        "Company": sel["companyName"],
+        "Type": sel["Type"],
+        "Opens": sel["Open"].dt.strftime("%d-%b-%Y"),
+        "Closes": sel["Close"].dt.strftime("%d-%b-%Y"),
+        "Price Band": sel["issuePrice"],
+        "Issue Size (≈ ₹ Cr)": sel["SizeCr"].apply(lambda v: f"{v:,.0f}" if pd.notna(v) else "-"),
+        "Status": sel.apply(when, axis=1),
+    })
+    st.dataframe(out, use_container_width=True, hide_index=True)
+
+
+# ============================================================================
 # 📈 OPTION CHAIN OPEN INTEREST (OI) ANALYSIS — Nifty (live, NSE) + Sensex
 # (best-effort, BSE). Mirrors the layout of public OI-visualization tools:
 # Call OI vs Put OI bars by strike, Total OI vs Change-in-OI toggle, PCR,
@@ -1885,5 +1991,32 @@ with oi_tab_sensex:
             "option chain directly. (This is a known limitation, not a bug we can fully fix without a paid "
             "broker API like Kite Connect, which does expose BSE index option-chain data reliably.)"
         )
+
+# ============================================================================
+# 🚀 IPO CALENDAR SECTION (weekly + monthly)
+# ============================================================================
+st.markdown("---")
+st.header("🚀 IPO Calendar — Weekly & Monthly")
+st.caption(
+    "Active and forthcoming IPOs (Mainboard + SME) from NSE's public issues feed. "
+    "Issue size in ₹ Cr is an approximation (shares offered × upper price band). "
+    "Informational only — not a recommendation to subscribe. Check the RHP/prospectus and "
+    "your broker/ASBA page for official details."
+)
+ipo_df = fetch_nse_ipos()
+if ipo_df is None or ipo_df.empty:
+    st.error(
+        "❔ IPO data unavailable right now — NSE's feed blocked or timed out this request "
+        "(common on cloud-hosted servers). No fabricated data is shown. Retry shortly, or see "
+        "nseindia.com → Market Data → Upcoming Issues."
+    )
+else:
+    ipo_today, ipo_windows = ipo_period_bounds()
+    ipo_tabs = st.tabs(list(ipo_windows.keys()))
+    for tab, (lbl, (s_, e_)) in zip(ipo_tabs, ipo_windows.items()):
+        with tab:
+            render_ipo_table(ipo_df, s_, e_, ipo_today, lbl)
+    st.caption("Note: NSE lists issues only once announced, so 'Next Month' may be sparse until dates are published. "
+               "BSE-only SME issues may not appear in this feed.")
 
 st.caption("Not financial advice. For educational use only.")
